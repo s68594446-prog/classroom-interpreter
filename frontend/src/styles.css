@@ -1,0 +1,193 @@
+:root {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #18201d;
+  background: #f4f7f5;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(760px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 56px 0;
+}
+
+.eyebrow,
+.label,
+.phase {
+  color: #5b6c65;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 8px 0;
+  font-size: clamp(2rem, 6vw, 3.6rem);
+}
+
+h2 {
+  margin-top: 0;
+}
+
+.session-card,
+.subtitle-card,
+.health-card {
+  margin-top: 24px;
+  padding: 24px;
+  border: 1px solid #d6dfda;
+  border-radius: 16px;
+  background: #ffffff;
+}
+
+label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #cbd6d0;
+  border-radius: 8px;
+  background: #f7f9f8;
+}
+
+.session-status,
+.health-row,
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.session-status {
+  margin-top: 20px;
+}
+
+.session-status time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.health-row {
+  padding: 8px 0;
+  border-top: 1px solid #eef2f0;
+}
+
+.health-row span:last-child {
+  margin-left: auto;
+  color: #6d7974;
+  font-size: 0.78rem;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #87928e;
+}
+
+.status-green { background: #1c9b5f; }
+.status-yellow { background: #d19a16; }
+.status-red { background: #cc3e42; }
+.status-unknown { background: #87928e; }
+
+footer {
+  justify-content: flex-end;
+  margin-top: 24px;
+}
+
+button {
+  padding: 10px 18px;
+  border: 0;
+  border-radius: 8px;
+}
+
+
+.controls {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.subtitle-row {
+  display: flex;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #eef2f0;
+}
+
+.subtitle-index {
+  color: #87928e;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  padding-top: 2px;
+}
+
+.subtitle-row .en {
+  margin: 0;
+  font-weight: 600;
+}
+
+.subtitle-row .zh {
+  margin: 4px 0 0;
+  color: #33443d;
+}
+
+.progress-line {
+  margin: 12px 0 0;
+  color: #5b6c65;
+  font-size: 0.9rem;
+}
+
+.delay-warning {
+  color: #a06a00;
+  font-weight: 600;
+}
+
+.error-text {
+  color: #cc3e42;
+  font-weight: 600;
+}
+
+.ws-ok,
+.ws-down {
+  font-size: 0.78rem;
+  color: #1c9b5f;
+}
+
+.ws-down {
+  color: #d19a16;
+}
+
+.recovery-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #e5c9c9;
+  border-radius: 12px;
+  background: #fdf7f7;
+}
+
+.recovery-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}

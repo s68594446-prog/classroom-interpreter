@@ -1,0 +1,51 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# IDE / macOS
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime and sensitive classroom data
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.wav
+*.mp3
+*.pcm
+*.flac
+*.m4a
+*.transcript.*
+*.translation.*
+summary-work/
+debug-content/
+
+# Generated test/review artifacts
+artifacts/
+reports/generated/
+playwright-report/
+test-results/
+*.sqlite3-wal
+*.sqlite3-shm

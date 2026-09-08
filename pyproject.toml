@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "classroom-interpreter"
+version = "0.1.0"
+description = "Phase 1 skeleton for a local-first classroom interpreter"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.136,<0.137",
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.14,<3",
+  "uvicorn>=0.48,<0.49",
+]
+
+[project.optional-dependencies]
+audio = ["sounddevice>=0.5,<0.6", "numpy>=2,<3", "soxr>=1,<2", "psutil>=7,<8"]
+dev = [
+  "httpx2>=2,<3",
+  "pytest>=8.4,<9",
+]
+
+[tool.setuptools]
+package-dir = {"" = "backend"}
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["classroom_interpreter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["backend"]
+addopts = "-q"
