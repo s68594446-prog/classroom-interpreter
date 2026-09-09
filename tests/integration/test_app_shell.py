@@ -29,6 +29,7 @@ def test_backend_starts_and_health_is_explicitly_actionable(tmp_path: Path) -> N
             "asr",
             "translation",
             "provider",
+            "runtime-supervision",
         }
         by_name = {c.name: c for c in health.components}
         # No runtime wired and no key configured: honest unknowns, actionable red.

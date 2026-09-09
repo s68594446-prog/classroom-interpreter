@@ -245,6 +245,10 @@ class CleanupAgent:
             raise PurgeRefused("session has a saved summary; purge applies instead")
         if record.status == "PURGED":
             return {"outcome": "ALREADY_DELETED", "files_deleted": 0}
+        if record.status not in ("NEW", "RECOVERY_REQUIRED"):
+            raise PurgeRefused(
+                f"ACTIVE_OR_IN_PROGRESS_SESSION: refusing delete in {record.status}"
+            )
 
         manifest = self._load_or_skip_manifest(session_id, resume=True)
         files_deleted = 0

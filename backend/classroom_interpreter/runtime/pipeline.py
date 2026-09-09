@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,8 +11,9 @@ from classroom_interpreter.agents.segmentation import (
     SegmentAgent,
     SegmenterConfig,
 )
+from classroom_interpreter.agents.health import HealthMetricsStore, HealthMonitorAgent
 from classroom_interpreter.agents.transcription import TranscriptionAgent
-from classroom_interpreter.agents.translation import TranslationAgent
+from classroom_interpreter.agents.translation import TranslationAgent, TranslationSequencer
 from classroom_interpreter.config import Settings
 from classroom_interpreter.domain.models import (
     SessionRecord,
@@ -19,6 +21,7 @@ from classroom_interpreter.domain.models import (
     WebSocketEventKind,
 )
 from classroom_interpreter.storage import Database, SessionRepository
+from classroom_interpreter.logging import MetadataLogEvent, log_metadata
 
 from .events import EventPublisher
 
@@ -75,6 +78,16 @@ class SessionOrchestrator:
         self._stop = asyncio.Event()
         self._finalize_task: asyncio.Task | None = None
         self.last_finalization_error: str | None = None
+        self.worker_faults: dict[str, dict[str, int | str]] = {}
+        self.health_store = HealthMetricsStore(
+            settings.health_database_path,
+            max_buffered=settings.health_buffer_max_samples,
+        )
+        self.health_monitor = HealthMonitorAgent(
+            self.health_store,
+            self,
+            interval_seconds=settings.health_flush_interval_seconds,
+        )
 
     # ------------------------------------------------------------- lifecycle
 
@@ -136,40 +149,61 @@ class SessionOrchestrator:
         self._segmenter = SegmentAgent(
             self.database, session_store, session_id, segment_config
         )
-        self._asr_worker = TranscriptionAgent(
-            self.database,
-            self.asr_provider,
-            worker_id="asr-main",
-            lease_seconds=self.settings.asr_lease_seconds,
-            max_attempts=self.settings.asr_max_attempts,
-            backoff_base_seconds=self.settings.asr_backoff_base_seconds,
-            backoff_cap_seconds=self.settings.asr_backoff_cap_seconds,
-            request_timeout_seconds=self.settings.asr_request_timeout_seconds,
-            jitter_fraction=0.0,
-            event_sink=self._event_sink,
+        self._asr_workers = [
+            TranscriptionAgent(
+                self.database,
+                self.asr_provider,
+                worker_id=f"asr-{index + 1}",
+                lease_seconds=self.settings.asr_lease_seconds,
+                max_attempts=self.settings.asr_max_attempts,
+                backoff_base_seconds=self.settings.asr_backoff_base_seconds,
+                backoff_cap_seconds=self.settings.asr_backoff_cap_seconds,
+                request_timeout_seconds=self.settings.asr_request_timeout_seconds,
+                jitter_fraction=0.0,
+                event_sink=self._event_sink,
+            )
+            for index in range(self.asr_worker_count)
+        ]
+        self._translation_workers = [
+            TranslationAgent(
+                self.database,
+                self.translation_provider,
+                worker_id=f"translation-{index + 1}",
+                lease_seconds=self.settings.translation_lease_seconds,
+                max_attempts=self.settings.translation_max_attempts,
+                backoff_base_seconds=self.settings.translation_backoff_base_seconds,
+                backoff_cap_seconds=self.settings.translation_backoff_cap_seconds,
+                request_timeout_seconds=self.settings.translation_request_timeout_seconds,
+                context_max_segments=self.settings.context_max_segments,
+                context_max_seconds=self.settings.context_max_seconds,
+                context_max_tokens=self.settings.context_max_tokens,
+                jitter_fraction=0.0,
+            )
+            for index in range(self.translation_worker_count)
+        ]
+        self._translation_sequencer = TranslationSequencer(
+            self.database, event_sink=self._event_sink
         )
-        self._translation_worker = TranslationAgent(
-            self.database,
-            self.translation_provider,
-            worker_id="translation-main",
-            lease_seconds=self.settings.translation_lease_seconds,
-            max_attempts=self.settings.translation_max_attempts,
-            backoff_base_seconds=self.settings.translation_backoff_base_seconds,
-            backoff_cap_seconds=self.settings.translation_backoff_cap_seconds,
-            request_timeout_seconds=self.settings.translation_request_timeout_seconds,
-            context_max_segments=self.settings.context_max_segments,
-            context_max_seconds=self.settings.context_max_seconds,
-            context_max_tokens=self.settings.context_max_tokens,
-            jitter_fraction=0.0,
-            event_sink=self._event_sink,
-        )
+        # Compatibility handles for focused tests and finalization diagnostics.
+        self._asr_worker = self._asr_workers[0]
+        self._translation_worker = self._translation_workers[0]
 
     def _spawn_workers(self) -> None:
         self._build_workers(self.active_session)
         self._tasks = [
             asyncio.create_task(self._segmenter_loop(), name="segmenter-loop"),
-            asyncio.create_task(self._asr_loop(), name="asr-loop"),
-            asyncio.create_task(self._translation_loop(), name="translation-loop"),
+            *[
+                asyncio.create_task(self._asr_loop(worker), name=f"asr-loop-{index + 1}")
+                for index, worker in enumerate(self._asr_workers)
+            ],
+            *[
+                asyncio.create_task(
+                    self._translation_loop(worker),
+                    name=f"translation-loop-{index + 1}",
+                )
+                for index, worker in enumerate(self._translation_workers)
+            ],
+            asyncio.create_task(self._sequencer_loop(), name="translation-sequencer-loop"),
         ]
 
     def _event_sink(self, kind: str, payload: dict) -> None:
@@ -181,7 +215,7 @@ class SessionOrchestrator:
         while not self._stop.is_set():
             try:
                 self._segmenter.process_available_chunks()
-            except CorruptCaptureChunk:
+            except CorruptCaptureChunk as exc:
                 self.last_finalization_error = "CORRUPT_CAPTURE_CHUNK"
                 if self.active_session:
                     self.repository.update_session_error(
@@ -189,17 +223,21 @@ class SessionOrchestrator:
                         category="MALFORMED",
                         safe_message="a sealed capture chunk failed verification",
                     )
-                return
+                self._record_worker_fault("segmenter", exc)
+            except Exception as exc:
+                self._record_worker_fault("segmenter", exc)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
 
-    async def _asr_loop(self) -> None:
+    async def _asr_loop(self, worker=None) -> None:
+        worker = worker or self._asr_worker
         while not self._stop.is_set():
             try:
-                worked = await self._asr_worker.step()
-            except Exception:
+                worked = await worker.step()
+            except Exception as exc:
+                self._record_worker_fault(worker.worker_id, exc)
                 worked = False
             if worked:
                 continue
@@ -208,11 +246,13 @@ class SessionOrchestrator:
             except asyncio.TimeoutError:
                 continue
 
-    async def _translation_loop(self) -> None:
+    async def _translation_loop(self, worker=None) -> None:
+        worker = worker or self._translation_worker
         while not self._stop.is_set():
             try:
-                worked = await self._translation_worker.step()
-            except Exception:
+                worked = await worker.step()
+            except Exception as exc:
+                self._record_worker_fault(worker.worker_id, exc)
                 worked = False
             if worked:
                 continue
@@ -220,6 +260,41 @@ class SessionOrchestrator:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.3)
             except asyncio.TimeoutError:
                 continue
+
+    async def _sequencer_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                worked = await self._translation_sequencer.step()
+            except Exception as exc:
+                self._record_worker_fault("translation-sequencer", exc)
+                worked = False
+            if worked:
+                continue
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+    def _record_worker_fault(self, agent_name: str, exc: Exception) -> None:
+        prior = self.worker_faults.get(agent_name, {})
+        self.worker_faults[agent_name] = {
+            "count": int(prior.get("count", 0)) + 1,
+            "error_type": type(exc).__name__,
+        }
+        self.health_store.record_heartbeat(
+            agent_name, "degraded", error_code=type(exc).__name__
+        )
+        self.health_store.record_metric("worker.exception_count", 1.0)
+        log_metadata(
+            logging.getLogger("classroom_interpreter.runtime"),
+            MetadataLogEvent(
+                agent=agent_name,
+                event="worker_step_exception",
+                status="degraded",
+                session_id=self.active_session,
+                error_code=type(exc).__name__,
+            ),
+        )
 
     async def pause(self, session_id: str) -> SessionRecord:
         self._assert_active(session_id)
@@ -288,8 +363,9 @@ class SessionOrchestrator:
         """
         try:
             segmenter = getattr(self, "_segmenter", None)
-            asr = getattr(self, "_asr_worker", None)
-            translation = getattr(self, "_translation_worker", None)
+            asr_workers = getattr(self, "_asr_workers", [])
+            translation_workers = getattr(self, "_translation_workers", [])
+            sequencer = getattr(self, "_translation_sequencer", None)
             drain_deadline = time.monotonic() + 120.0
             while time.monotonic() < drain_deadline:
                 progressed = False
@@ -299,10 +375,15 @@ class SessionOrchestrator:
                     except CorruptCaptureChunk:
                         self.last_finalization_error = "CORRUPT_CAPTURE_CHUNK"
                         break
-                if asr is not None and await asr.step():
-                    progressed = True
-                if translation is not None and await translation.step():
-                    progressed = True
+                for asr in asr_workers:
+                    if await asr.step():
+                        progressed = True
+                for translation in translation_workers:
+                    if await translation.step():
+                        progressed = True
+                if sequencer is not None:
+                    while await sequencer.step():
+                        progressed = True
                 if segmenter is not None:
                     segmenter.seal_tail()
                 counts = self._pending_counts(session_id)
@@ -449,6 +530,12 @@ class SessionOrchestrator:
     def delete_session(self, session_id: str) -> dict:
         """User-requested deletion of an unfinished session (explicit,
         destructive, never automatic)."""
+        if self.active_session == session_id:
+            from classroom_interpreter.agents.cleanup import PurgeRefused
+
+            raise PurgeRefused(
+                "ACTIVE_RUNTIME_OWNERSHIP: stop and enter recovery before deletion"
+            )
         return self._make_cleanup().delete_unfinished(session_id)
 
     # ------------------------------------------------------------ recovery
@@ -495,6 +582,10 @@ class SessionOrchestrator:
             return record
         if self.active_session is not None:
             raise SingleActiveSessionError("a session is already active")
+        self._build_workers(session_id)
+        # A process crash invalidates open VAD buffers. Rebuild from durable
+        # capture after the contiguous DONE prefix before changing lifecycle.
+        self._segmenter.rebuild_unconfirmed_tail()
         self.repository.transition_session(
             session_id,
             SessionStatus.FINALIZING,
@@ -502,7 +593,6 @@ class SessionOrchestrator:
             actor="orchestrator",
         )
         self.active_session = session_id
-        self._build_workers(session_id)
         self._finalize_task = asyncio.create_task(
             self._finalize(session_id), name="recovery-drain"
         )

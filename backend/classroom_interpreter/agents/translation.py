@@ -15,16 +15,16 @@ from classroom_interpreter.storage.repository import (
 )
 
 NON_RETRYABLE_CATEGORIES = frozenset({"AUTH", "BALANCE", "CONTENT_FILTER"})
+TRANSLATION_CONTEXT_SNAPSHOT_VERSION = 1
 
 
 @dataclass(slots=True)
 class TranslationAgent:
-    """Orders translations per session against the durable cursor.
+    """Concurrently prepares translations for durable ordered release.
 
-    Only the segment at each session's `next_translation_sequence` is claimed
-    (head-of-line by design); the context reads committed predecessors only.
-    Provider calls run strictly outside database transactions; commits are
-    idempotent, hash-bound, and strictly ordered by `commit_translation_result`.
+    Workers may claim later ASR-complete segments while an earlier request is
+    slow. Provider calls run outside transactions. Results are hash-bound and
+    staged durably; TranslationSequencer is the only public commit path.
     """
 
     database: Database
@@ -97,7 +97,17 @@ class TranslationAgent:
             ).fetchone()
         attempt_number = int(row["attempt_number"]) if row else 1
 
-        window = self._context.build(segment.session_id, segment.sequence)
+        window = self._repository.load_translation_context_snapshot(
+            segment.session_id, segment.sequence
+        )
+        if window is None:
+            candidate_window = self._context.build(segment.session_id, segment.sequence)
+            window = self._repository.get_or_create_translation_context_snapshot(
+                segment.session_id,
+                segment.sequence,
+                candidate_window,
+                prompt_version=TRANSLATION_CONTEXT_SNAPSHOT_VERSION,
+            )
         request = TranslationRequest(
             segment_id=segment.id,
             session_id=segment.session_id,
@@ -150,7 +160,7 @@ class TranslationAgent:
             return
         latency_ms = int((utc_now() - started).total_seconds() * 1000)
         try:
-            outcome = self._repository.commit_translation_result(
+            self._repository.stage_translation_result(
                 segment.session_id, segment.sequence, result
             )
         except SourceHashMismatch:
@@ -183,17 +193,6 @@ class TranslationAgent:
             latency_ms=latency_ms,
             provider_request_id=result.provider_request_id,
         )
-        if outcome.name == "CREATED" and self.event_sink is not None:
-            self.event_sink(
-                "subtitle.committed",
-                {
-                    "sequence": segment.sequence,
-                    "segment_id": segment.id,
-                    "english_text": window.current_english_text,
-                    "chinese_text": result.chinese_text,
-                },
-            )
-
     def _classify_and_store(
         self,
         segment,
@@ -286,3 +285,31 @@ class TranslationAgent:
             jitter = abs(self._rng.gauss(0, delay * self.jitter_fraction))
             delay = min(delay * (1 + self.jitter_fraction), delay + jitter)
         return delay
+
+
+@dataclass(slots=True)
+class TranslationSequencer:
+    """The sole staged-result → public-result ordered release boundary."""
+
+    database: Database
+    event_sink: object | None = None
+    _repository: SessionRepository = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._repository = SessionRepository(self.database)
+
+    async def step(self) -> bool:
+        released = self._repository.release_next_translation_result()
+        if released is None:
+            return False
+        if self.event_sink is not None:
+            self.event_sink(
+                "subtitle.committed",
+                {
+                    "sequence": released["sequence"],
+                    "segment_id": released["segment_id"],
+                    "english_text": released["english_text"],
+                    "chinese_text": released["chinese_text"],
+                },
+            )
+        return True

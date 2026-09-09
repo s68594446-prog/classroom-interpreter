@@ -20,6 +20,8 @@ from classroom_interpreter.providers.summary_contract import (
 from classroom_interpreter.storage import Database
 from classroom_interpreter.storage.repository import SessionRepository
 
+_replace_summary_file = os.replace
+
 
 class SummaryValidationError(RuntimeError):
     """Raised when source transcript or provider output fails validation."""
@@ -318,30 +320,15 @@ class SummaryAgent:
         summary_path = self._atomic_write(session_id, record.course_name, document)
         saved_hash = hashlib.sha256(summary_path.read_bytes()).hexdigest()
 
-        # Only now advance the session: SUMMARY_SAVED is the purge gate key.
-        repository.transition_session(
+        # Only now advance the session: metadata, state and audit commit in one
+        # SQLite transaction. SUMMARY_SAVED can never be visible without the
+        # path/hash needed by the independent purge gate.
+        repository.commit_summary_saved(
             session_id,
-            SessionStatus.SUMMARY_SAVED,
-            reason_code="SUMMARY_SAVED",
-            actor="summary_agent",
+            summary_path=summary_path,
+            summary_hash=saved_hash,
+            summary_model=self.provider.model,
         )
-        with self.database.transaction() as connection:
-            connection.execute(
-                """
-                UPDATE sessions
-                SET summary_path = ?, summary_hash = ?, summary_model = ?,
-                    summary_saved_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    str(summary_path),
-                    saved_hash,
-                    self.provider.model,
-                    datetime.now(timezone.utc).isoformat(),
-                    datetime.now(timezone.utc).isoformat(),
-                    session_id,
-                ),
-            )
         self._set_job_state(job["id"], "SAVED")
         return summary_path
 
@@ -362,11 +349,18 @@ class SummaryAgent:
             raise SummaryValidationError("summary path must live outside the session tree")
         temporary = final_path.with_suffix(".md.tmp")
         payload = document.encode("utf-8")
+        if temporary.is_symlink():
+            raise SummaryValidationError("summary temporary path is a symlink")
+        if temporary.exists():
+            # A prior process may have died after temp fsync but before rename.
+            # It is derived output and safe to regenerate from durable summary
+            # work; never follow or overwrite a symlink.
+            temporary.unlink()
         with temporary.open("xb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, final_path)
+        _replace_summary_file(temporary, final_path)
         sync_directory(final_path.parent)
         read_back = final_path.read_bytes()
         if hashlib.sha256(read_back).hexdigest() != hashlib.sha256(payload).hexdigest():

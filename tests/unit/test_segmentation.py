@@ -141,15 +141,28 @@ def test_crash_resume_checkpoint_reproduces_same_segments(database, tmp_path):
     expected = segment_rows(database, session_a)
     assert len(expected) >= 2
 
-    # Simulate restarts between every chunk: each fresh agent reloads the
-    # durable cursor exactly like a post-crash recovery would.
+    # Expose only the first half, persist an open VAD cursor, then make the rest
+    # durable and simulate a process restart. Recovery must rebuild from capture
+    # rather than cold-resume that open cursor.
     session_b = h.make_session(database, "restarted")
     chunk_dir_b = tmp_path / "capture" / session_b
-    h.write_chunks(database, chunk_dir_b, session_b, blocks, chunk_seconds=10)
-    total_chunks = len(list(chunk_dir_b.glob("chunk_*.wav")))
-    for _ in range(total_chunks):
-        resumed = make_agent(database, tmp_path, session_b, max_seconds=30.0)
-        resumed.process_available_chunks()
+    split = len(blocks) // 2
+    h.write_chunks(
+        database, chunk_dir_b, session_b, blocks[:split], chunk_seconds=10,
+        start_ns=1_000_000_000,
+    )
+    crashed = make_agent(database, tmp_path, session_b, max_seconds=30.0)
+    crashed.process_available_chunks()
+    elapsed_ns = 1_000_000_000 + round(
+        sum(len(block) // 2 for block in blocks[:split]) / h.RATE * 1_000_000_000
+    )
+    h.write_chunks(
+        database, chunk_dir_b, session_b, blocks[split:], chunk_seconds=10,
+        start_ns=elapsed_ns,
+    )
+    resumed = make_agent(database, tmp_path, session_b, max_seconds=30.0)
+    resumed.rebuild_unconfirmed_tail()
+    resumed.process_available_chunks()
     resumed.seal_tail()
     actual = segment_rows(database, session_b)
 
@@ -161,6 +174,57 @@ def test_crash_resume_checkpoint_reproduces_same_segments(database, tmp_path):
         assert got["start_ms"] == pytest.approx(want["start_ms"], abs=20)
         assert got["end_ms"] == pytest.approx(want["end_ms"], abs=20)
         assert got["duration_ms"] == pytest.approx(want["duration_ms"], abs=40)
+
+
+def test_restart_rebuilds_open_vad_tail_from_capture_not_saved_cursor(database, tmp_path):
+    session_id = h.make_session(database, "crash-mid-utterance")
+    chunk_dir = tmp_path / "capture" / session_id
+    h.write_chunks(
+        database, chunk_dir, session_id,
+        h.envelope_blocks([("speech", 3.0)]),
+        chunk_seconds=10,
+        start_ns=1_000_000_000,
+    )
+    before_crash = make_agent(database, tmp_path, session_id)
+    assert before_crash.process_available_chunks() == ()
+    with database.transaction() as connection:
+        cursor = connection.execute(
+            "SELECT in_utterance, pending_pcm FROM pipeline_cursors WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        assert cursor["in_utterance"] == 1 and len(cursor["pending_pcm"]) > 0
+        # Model a crash-corrupted/inexact open boundary. Ordinary cursor resume
+        # would trust these bytes and start time.
+        connection.execute(
+            """
+            UPDATE pipeline_cursors
+            SET pending_pcm = ?, utterance_start_ms = 9000,
+                utterance_voiced_frames = 1
+            WHERE session_id = ?
+            """,
+            (b"\x00\x00" * 160, session_id),
+        )
+    h.write_chunks(
+        database, chunk_dir, session_id,
+        h.envelope_blocks([("speech", 2.0), ("silence", 1.0)]),
+        chunk_seconds=10,
+        start_ns=4_000_000_000,
+    )
+
+    restarted = make_agent(database, tmp_path, session_id)
+    evidence = restarted.rebuild_unconfirmed_tail()
+    assert evidence == {
+        "kept_done_segments": 0,
+        "removed_unconfirmed_segments": 0,
+        "restart_boundary_ms": 0,
+    }
+    restarted.process_available_chunks()
+    restarted.seal_tail()
+    rows = segment_rows(database, session_id)
+    assert len(rows) == 1
+    assert rows[0]["start_ms"] == pytest.approx(0, abs=20)
+    assert rows[0]["end_ms"] == pytest.approx(5_700, abs=40)
+    assert rows[0]["duration_ms"] == pytest.approx(5_700, abs=40)
 
 
 def test_resume_never_duplicates_sealed_segments(database, tmp_path):

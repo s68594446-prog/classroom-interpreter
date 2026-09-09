@@ -11,6 +11,7 @@ from classroom_interpreter.agents.summary import (
     SummaryAgent,
     SummaryValidationError,
 )
+from classroom_interpreter.agents.cleanup import CleanupAgent, PurgeRefused
 from classroom_interpreter.providers.errors import ProviderFailure
 from classroom_interpreter.providers.mocks import MockSummaryProvider
 from classroom_interpreter.providers.summary_contract import REQUIRED_SECTIONS
@@ -21,7 +22,7 @@ from classroom_interpreter.domain.models import (
 )
 from classroom_interpreter.storage.repository import SessionRepository
 
-from test_live_api import FakeASR, FakeListener, FakeTranslation, make_client
+from test_live_api import FakeASR, FakeListener, FakeTranslation, make_client, wait_for_status
 
 
 def make_summary_agent(tmp_path: Path, database, provider=None) -> SummaryAgent:
@@ -196,3 +197,87 @@ def test_summary_write_is_atomic_no_temp_residue(tmp_path):
     assert status == "SUMMARY_SAVED"
     assert not list(summaries.glob("*.tmp"))
     assert len(list(summaries.glob("*.md"))) == 1
+
+
+def test_summary_metadata_and_saved_state_roll_back_together_on_crash_boundary(tmp_path):
+    """Inject a DB abort after the session UPDATE but before the audit insert.
+
+    If metadata/state were separate commits, this leaves a false SUMMARY_SAVED.
+    With one transaction, SQLite rolls the UPDATE back and purge stays closed.
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post(
+            "/api/sessions", json={"course_name": "Atomic Summary"}
+        ).json()
+        session_id = view["session"]["id"]
+        with database.connect() as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER inject_summary_commit_crash
+                BEFORE INSERT ON state_transition_audits
+                WHEN NEW.to_state = 'SUMMARY_SAVED'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected summary commit crash');
+                END
+                """
+            )
+        assert client.post(f"/api/sessions/{session_id}/end").status_code == 200
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            record = SessionRepository(database).get_session(session_id)
+            if record.status is SessionStatus.RECOVERY_REQUIRED:
+                break
+            time.sleep(0.05)
+
+    record = SessionRepository(database).get_session(session_id)
+    assert record.status is SessionStatus.RECOVERY_REQUIRED
+    assert record.summary_path is None
+    assert record.summary_hash is None
+    assert len(list((tmp_path / "data" / "summaries").glob("*.md"))) == 1
+    cleanup = CleanupAgent(
+        database,
+        summaries_root=tmp_path / "data" / "summaries",
+        session_store_root=tmp_path / "data" / "sessions",
+    )
+    with pytest.raises(PurgeRefused, match="NO_VALID_SUMMARY"):
+        cleanup.purge(session_id)
+
+
+def test_summary_retry_recovers_temp_left_by_crash_before_rename(tmp_path, monkeypatch):
+    import classroom_interpreter.agents.summary as summary_module
+
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    original_replace = summary_module._replace_summary_file
+    injected = {"raised": False}
+
+    def crash_before_rename(source, destination):
+        if str(source).endswith(".md.tmp") and not injected["raised"]:
+            injected["raised"] = True
+            raise RuntimeError("injected crash before summary rename")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(summary_module, "_replace_summary_file", crash_before_rename)
+    with client:
+        view = client.post(
+            "/api/sessions", json={"course_name": "Temp Crash"}
+        ).json()
+        session_id = view["session"]["id"]
+        assert client.post(f"/api/sessions/{session_id}/end").status_code == 200
+        failed = wait_for_status(client, session_id, ("RECOVERY_REQUIRED",))
+        assert failed["session"]["status"] == "RECOVERY_REQUIRED"
+        temporary_files = list((tmp_path / "data" / "summaries").glob("*.md.tmp"))
+        assert len(temporary_files) == 1
+
+        monkeypatch.setattr(summary_module, "_replace_summary_file", original_replace)
+        resumed = client.post(f"/api/recovery/{session_id}/resume")
+        assert resumed.status_code == 200
+        saved = wait_for_status(
+            client, session_id, ("SUMMARY_SAVED", "RECOVERY_REQUIRED")
+        )
+        assert saved["session"]["status"] == "SUMMARY_SAVED"
+
+    assert injected["raised"]
+    assert not list((tmp_path / "data" / "summaries").glob("*.tmp"))
+    record = SessionRepository(database).get_session(session_id)
+    assert record.summary_path is not None and Path(record.summary_path).is_file()

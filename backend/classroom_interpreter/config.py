@@ -65,6 +65,8 @@ class Settings(BaseSettings):
 
     summary_chunk_token_budget: int = Field(default=3000, gt=0)
     summary_max_attempts: int = Field(default=3, ge=1)
+    health_flush_interval_seconds: float = Field(default=1.0, gt=0)
+    health_buffer_max_samples: int = Field(default=4096, ge=64)
 
     @field_validator("app_host")
     @classmethod
@@ -115,6 +117,10 @@ class Settings(BaseSettings):
     @property
     def database_path(self) -> Path:
         return self.classroom_interpreter_data_dir.expanduser() / "runtime.sqlite3"
+
+    @property
+    def health_database_path(self) -> Path:
+        return self.classroom_interpreter_data_dir.expanduser() / "health.sqlite3"
 
 
 def get_settings() -> Settings:

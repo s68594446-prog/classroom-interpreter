@@ -174,6 +174,94 @@ class SegmentAgent:
             ),
         )
 
+    def rebuild_unconfirmed_tail(self) -> dict[str, int]:
+        """Discard open cursor state and re-derive after the DONE prefix.
+
+        Persisted capture chunks remain authoritative. Only a contiguous DONE
+        segment prefix is trusted across process restart; every later derived
+        row is removed and VAD resumes from the first capture sample after the
+        prefix's confirmed end boundary (D-035).
+        """
+        stale_paths: list[Path] = []
+        with self.database.transaction() as connection:
+            segments = connection.execute(
+                "SELECT id, sequence, end_ms, audio_path, state FROM segments WHERE session_id = ? ORDER BY sequence",
+                (self.session_id,),
+            ).fetchall()
+            keep_count = 0
+            boundary_ms = 0
+            for row in segments:
+                if row["sequence"] != keep_count or row["state"] != SegmentState.DONE.value:
+                    break
+                keep_count += 1
+                boundary_ms = int(row["end_ms"])
+            stale = [row for row in segments if row["sequence"] >= keep_count]
+            stale_paths = [Path(row["audio_path"]) for row in stale]
+            for row in stale:
+                connection.execute(
+                    "DELETE FROM state_transition_audits WHERE entity_id = ?",
+                    (row["id"],),
+                )
+            connection.execute(
+                "DELETE FROM segments WHERE session_id = ? AND sequence >= ?",
+                (self.session_id, keep_count),
+            )
+            connection.execute(
+                """
+                UPDATE sessions SET next_translation_sequence = ?, updated_at = ?,
+                    version = version + 1 WHERE id = ?
+                """,
+                (keep_count, datetime.now(timezone.utc).isoformat(), self.session_id),
+            )
+            chunk = connection.execute(
+                """
+                SELECT sequence, capture_epoch, start_ms, end_ms, sample_rate,
+                       frame_count
+                FROM capture_chunks
+                WHERE session_id = ? AND end_ms > ?
+                ORDER BY sequence LIMIT 1
+                """,
+                (self.session_id, boundary_ms),
+            ).fetchone()
+            if chunk is None:
+                tail = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), -1) + 1 AS next FROM capture_chunks WHERE session_id = ?",
+                    (self.session_id,),
+                ).fetchone()
+                next_chunk = int(tail["next"])
+                native_frames = normalized_frames = epoch = 0
+            else:
+                next_chunk = int(chunk["sequence"])
+                offset_ms = max(0, boundary_ms - int(chunk["start_ms"]))
+                native_frames = min(
+                    int(chunk["frame_count"]),
+                    round(offset_ms * int(chunk["sample_rate"]) / 1000),
+                )
+                normalized_frames = offset_ms // FRAME_MS
+                epoch = int(chunk["capture_epoch"])
+            rebuilt = SegmenterState(
+                next_chunk_sequence=next_chunk,
+                consumed_native_frames=native_frames,
+                consumed_normalized_frames=normalized_frames,
+                current_epoch=epoch,
+            )
+            self._checkpoint(connection, rebuilt)
+
+        session_root = self.segments_dir.resolve()
+        for path in stale_paths:
+            if path.is_symlink():
+                raise CorruptCaptureChunk("derived segment path is a symlink")
+            if path.exists() and path.resolve().is_relative_to(session_root):
+                path.unlink()
+        self._state = rebuilt
+        self._normalizer = None
+        self._last_row = None
+        return {
+            "kept_done_segments": keep_count,
+            "removed_unconfirmed_segments": len(stale_paths),
+            "restart_boundary_ms": boundary_ms,
+        }
+
     # ------------------------------------------------------------------- main
 
     def process_available_chunks(self) -> tuple[SealedSegment, ...]:
@@ -382,6 +470,10 @@ class SegmentAgent:
             sequence = int(row["next"])
             final_path = self.segments_dir / f"seg_{sequence:06d}.wav"
             temporary_path = final_path.with_suffix(".wav.tmp")
+            if temporary_path.is_symlink():
+                raise CorruptCaptureChunk("segment temporary path is a symlink")
+            if temporary_path.exists():
+                temporary_path.unlink()
             with temporary_path.open("xb") as handle:
                 with wave.open(handle, "wb") as wav:
                     wav.setparams(

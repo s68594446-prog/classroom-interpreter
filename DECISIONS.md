@@ -130,6 +130,52 @@ implementation, per the frozen rule.
   transaction. `NO VALID SUMMARY = NO PURGE` is enforced by state gate plus
   independent revalidation, not convention.
 
+## Independent-review repair decisions (2026-09-08)
+
+These decisions narrow the implementation to the ten blocking findings in
+`reports/INDEPENDENT_REVIEW_2026-09-08.md`. They are repair design records, not
+acceptance or independent verification.
+
+- **D-032 (Repair implementation)**: A verified summary file is necessary but
+  not sufficient for `SUMMARY_SAVED`. The summary path, SHA256, model,
+  timestamp, session-state transition and transition audit are committed in one
+  SQLite transaction after file fsync, rename, directory fsync and read-back.
+  A final file left before that DB commit is safe to replace/adopt on retry;
+  stale regular `.md.tmp` files are removed before exclusive recreation, while
+  symlink temp paths fail closed.
+- **D-033 (Repair implementation)**: Destructive unfinished-session deletion is
+  permitted only for `RECOVERY_REQUIRED` or never-started `NEW` sessions and is
+  refused whenever the current runtime owns the session. Recording, paused,
+  finalizing, summarizing, saved and purging states are never DELETE-recovery
+  targets.
+- **D-034 (Repair implementation)**: ASR and translation worker-count settings
+  create that many independent leased workers. Translation workers may claim any
+  eligible ASR-complete segment and persist results in a durable staging table.
+  A separate per-session sequencer alone advances `next_translation_sequence`,
+  changes segments to `DONE`, writes public translation results and emits
+  committed events. The first context used before a provider call is stored as
+  versioned canonical JSON plus SHA256 and reused by every retry.
+- **D-035 (Repair implementation)**: Restart recovery does not trust open VAD
+  cursor buffers. It keeps only the contiguous `DONE` segment prefix, removes
+  later derived segment rows/files, resets the durable cursor to the first
+  persisted capture sample after that prefix's end boundary, and re-runs VAD
+  over the retained capture chunks before downstream drain.
+- **D-036 (Repair implementation)**: Every runtime worker loop has a catch-all
+  supervision boundary that records a content-free fault and continues after a
+  bounded idle wait. Health heartbeats and numeric metrics are buffered in
+  memory and batch-flushed to a dedicated `health.sqlite3`; metrics writes never
+  acquire the runtime pipeline database write lock. A bounded buffer drops the
+  oldest sample under pressure and reports the drop count as metadata only.
+- **D-037 (Repair implementation)**: A WebSocket connection subscribes to the
+  live publisher before persisted replay. Events accumulated during replay are
+  then consumed from the live queue and deduplicated by the connection's last
+  sequence, closing the replay-to-subscribe loss window.
+- **D-038 (Repair implementation)**: Accelerated soak production, segmentation,
+  ASR, translation staging and ordered sequencing overlap. The injected restart
+  occurs only after a non-zero durable cursor and measurable queued backlog
+  exist; the harness reconstructs agents, invokes boundary rebuild, and records
+  pre/post-restart evidence instead of reusing the earlier soak result.
+
 ## MiMo documentation snapshot (retained from Phase 0)
 
 Official sources checked:

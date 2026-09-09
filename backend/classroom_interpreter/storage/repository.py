@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from classroom_interpreter.domain.models import (
+    ContextWindow,
     SegmentRecord,
     SegmentState,
     SessionRecord,
@@ -129,6 +131,69 @@ class SessionRepository:
                 ) VALUES ('session', ?, ?, ?, ?, ?, ?)
                 """,
                 (session_id, current.value, target.value, reason_code, actor, now),
+            )
+        return self.get_session(session_id)
+
+    def commit_summary_saved(
+        self,
+        session_id: str,
+        *,
+        summary_path: Path,
+        summary_hash: str,
+        summary_model: str,
+    ) -> SessionRecord:
+        """Atomically bind verified summary metadata to the purge-gate state.
+
+        The summary file is fsynced and read-back verified by SummaryAgent before
+        this method is called. Metadata, state and audit share one transaction,
+        so an exception at any DB boundary cannot expose SUMMARY_SAVED without
+        the exact path/hash needed for independent purge validation.
+        """
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            current = SessionStatus(row["status"])
+            if current is SessionStatus.SUMMARY_SAVED:
+                if (
+                    row["summary_path"] == str(summary_path)
+                    and row["summary_hash"] == summary_hash
+                    and row["summary_model"] == summary_model
+                ):
+                    return self.get_session(session_id)
+                raise IdempotencyConflict(
+                    "SUMMARY_SAVED metadata differs from verified summary"
+                )
+            ensure_session_transition(current, SessionStatus.SUMMARY_SAVED)
+            connection.execute(
+                """
+                UPDATE sessions
+                SET status = 'SUMMARY_SAVED', summary_path = ?, summary_hash = ?,
+                    summary_model = ?, summary_saved_at = ?, updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                """,
+                (
+                    str(summary_path),
+                    summary_hash,
+                    summary_model,
+                    now,
+                    now,
+                    session_id,
+                ),
+            )
+            _insert_transition_audit(
+                connection,
+                entity_type="session",
+                entity_id=session_id,
+                from_state=current.value,
+                to_state=SessionStatus.SUMMARY_SAVED.value,
+                reason_code="SUMMARY_SAVED",
+                actor="summary_agent",
+                created_at=now,
             )
         return self.get_session(session_id)
 
@@ -673,12 +738,10 @@ class SessionRepository:
         lease_seconds: float,
         max_attempts: int,
     ) -> SegmentRecord | None:
-        """CAS-claim the next translation-eligible segment (per-session ordered).
+        """CAS-claim any translation-eligible segment.
 
-        Eligible work: the ASR_DONE segment at each session's
-        next_translation_sequence, plus TRANSLATION_RETRY rows whose backoff
-        elapsed, plus expired TRANSLATION_PROCESSING leases. Ordering is
-        per session (D-022); different sessions may proceed concurrently.
+        Provider work is deliberately not head-of-line ordered. Durable staged
+        results are released later by the per-session sequencer (D-034).
         """
         now = _now_iso()
         lease_expires = (
@@ -703,11 +766,9 @@ class SessionRepository:
             if row is None:
                 row = connection.execute(
                     """
-                    SELECT seg.* FROM sessions s
-                    JOIN segments seg
-                      ON seg.session_id = s.id AND seg.sequence = s.next_translation_sequence
-                    WHERE seg.state = 'ASR_DONE'
-                    ORDER BY s.id
+                    SELECT * FROM segments
+                    WHERE state = 'ASR_DONE'
+                    ORDER BY session_id, sequence
                     LIMIT 1
                     """,
                 ).fetchone()
@@ -798,6 +859,208 @@ class SessionRepository:
                 (str(uuid.uuid4()), row["session_id"], row["id"], attempt_number, now),
             )
             return self.get_segment(row["session_id"], row["sequence"])
+
+    def get_or_create_translation_context_snapshot(
+        self,
+        session_id: str,
+        sequence: int,
+        context: ContextWindow,
+        *,
+        prompt_version: int,
+    ) -> ContextWindow:
+        """Persist the exact first context used for a provider attempt."""
+        canonical = json.dumps(
+            context.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            segment = _require_segment(connection, session_id, sequence)
+            existing = connection.execute(
+                "SELECT * FROM translation_context_snapshots WHERE segment_id = ?",
+                (segment["id"],),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO translation_context_snapshots(
+                        segment_id, session_id, segment_sequence, prompt_version,
+                        context_json, context_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        segment["id"], session_id, sequence, prompt_version,
+                        canonical, digest, now,
+                    ),
+                )
+                stored = canonical
+            else:
+                stored = existing["context_json"]
+                if hashlib.sha256(stored.encode("utf-8")).hexdigest() != existing["context_sha256"]:
+                    raise IdempotencyConflict("translation context snapshot hash mismatch")
+        return ContextWindow.model_validate_json(stored)
+
+    def load_translation_context_snapshot(
+        self, session_id: str, sequence: int
+    ) -> ContextWindow | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT snapshot.context_json, snapshot.context_sha256
+                FROM translation_context_snapshots snapshot
+                JOIN segments segment ON segment.id = snapshot.segment_id
+                WHERE segment.session_id = ? AND segment.sequence = ?
+                """,
+                (session_id, sequence),
+            ).fetchone()
+        if row is None:
+            return None
+        canonical = row["context_json"]
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != row["context_sha256"]:
+            raise IdempotencyConflict("translation context snapshot hash mismatch")
+        return ContextWindow.model_validate_json(canonical)
+
+    def stage_translation_result(
+        self, session_id: str, sequence: int, result: TranslationResult
+    ) -> CommitOutcome:
+        """Durably buffer a provider result without making it publicly visible."""
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            segment = _require_segment(connection, session_id, sequence)
+            if result.segment_id != segment["id"]:
+                raise IdempotencyConflict(
+                    "translation result segment_id does not match durable key"
+                )
+            asr = connection.execute(
+                "SELECT english_text FROM asr_results WHERE segment_id = ?",
+                (segment["id"],),
+            ).fetchone()
+            if asr is None:
+                raise OrderingConflict("translation requires a committed ASR result")
+            expected_hash = hashlib.sha256(asr["english_text"].encode("utf-8")).hexdigest()
+            if expected_hash != result.english_text_sha256:
+                raise SourceHashMismatch(
+                    "translation source hash does not match committed English"
+                )
+            existing = connection.execute(
+                "SELECT * FROM translation_staged_results WHERE segment_id = ?",
+                (segment["id"],),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["chinese_text"] == result.chinese_text
+                    and existing["english_text_sha256"] == result.english_text_sha256
+                    and existing["provider"] == result.provider
+                    and existing["model"] == result.model
+                ):
+                    return CommitOutcome.ALREADY_COMMITTED
+                raise IdempotencyConflict(
+                    "translation result already staged with different content"
+                )
+            if SegmentState(segment["state"]) is not SegmentState.TRANSLATION_PROCESSING:
+                raise OrderingConflict("only a processing translation may be staged")
+            connection.execute(
+                """
+                INSERT INTO translation_staged_results(
+                    segment_id, session_id, segment_sequence, chinese_text,
+                    english_text_sha256, provider, model, provider_request_id,
+                    latency_ms, created_at, staged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    segment["id"], session_id, sequence, result.chinese_text,
+                    result.english_text_sha256, result.provider, result.model,
+                    result.provider_request_id, result.latency_ms,
+                    result.created_at.isoformat(), now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE segments SET lease_owner = NULL, lease_expires_at = NULL,
+                    updated_at = ? WHERE id = ?
+                """,
+                (now, segment["id"]),
+            )
+        return CommitOutcome.CREATED
+
+    def release_next_translation_result(self) -> dict | None:
+        """Release one staged result at a session's durable ordered cursor."""
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT staged.*, asr.english_text, seg.state AS segment_state
+                FROM sessions session
+                JOIN translation_staged_results staged
+                  ON staged.session_id = session.id
+                 AND staged.segment_sequence = session.next_translation_sequence
+                JOIN segments seg ON seg.id = staged.segment_id
+                JOIN asr_results asr ON asr.segment_id = staged.segment_id
+                ORDER BY staged.session_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            current = SegmentState(row["segment_state"])
+            ensure_segment_transition(current, SegmentState.DONE)
+            expected_hash = hashlib.sha256(row["english_text"].encode("utf-8")).hexdigest()
+            if expected_hash != row["english_text_sha256"]:
+                raise SourceHashMismatch("staged translation source hash mismatch")
+            connection.execute(
+                """
+                INSERT INTO translation_results(
+                    segment_id, session_id, segment_sequence, chinese_text,
+                    english_text_sha256, provider, model, provider_request_id,
+                    latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["segment_id"], row["session_id"], row["segment_sequence"],
+                    row["chinese_text"], row["english_text_sha256"], row["provider"],
+                    row["model"], row["provider_request_id"], row["latency_ms"],
+                    row["created_at"],
+                ),
+            )
+            connection.execute(
+                "UPDATE segments SET state = 'DONE', updated_at = ? WHERE id = ?",
+                (now, row["segment_id"]),
+            )
+            updated = connection.execute(
+                """
+                UPDATE sessions
+                SET next_translation_sequence = next_translation_sequence + 1,
+                    updated_at = ?, version = version + 1
+                WHERE id = ? AND next_translation_sequence = ?
+                """,
+                (now, row["session_id"], row["segment_sequence"]),
+            )
+            if updated.rowcount != 1:
+                raise OrderingConflict("translation cursor changed during release")
+            connection.execute(
+                "DELETE FROM translation_staged_results WHERE segment_id = ?",
+                (row["segment_id"],),
+            )
+            _insert_transition_audit(
+                connection,
+                entity_type="segment",
+                entity_id=row["segment_id"],
+                from_state=current.value,
+                to_state=SegmentState.DONE.value,
+                reason_code="TRANSLATION_RESULT_RELEASED",
+                actor="translation_sequencer",
+                created_at=now,
+            )
+            return {
+                "session_id": row["session_id"],
+                "sequence": row["segment_sequence"],
+                "segment_id": row["segment_id"],
+                "english_text": row["english_text"],
+                "chinese_text": row["chinese_text"],
+            }
 
     def finish_translation_attempt(
         self,

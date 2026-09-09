@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -94,7 +95,16 @@ def create_app(
                     status=f"reconciled_{moved}",
                 ),
             )
-        yield
+        health_stop = asyncio.Event()
+        health_task = asyncio.create_task(
+            app.state.runtime.health_monitor.run(health_stop),
+            name="health-monitor",
+        )
+        try:
+            yield
+        finally:
+            health_stop.set()
+            await health_task
 
     app = FastAPI(
         title=resolved_settings.app_name,

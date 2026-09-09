@@ -277,6 +277,41 @@ def test_websocket_replay_is_deterministic_and_ordered(tmp_path):
                 assert False, f"unexpected replayed event: {message}"
 
 
+def test_websocket_buffers_event_published_after_replay_query_before_stream(
+    tmp_path, monkeypatch
+):
+    """Deterministically inject the exact reviewer replay→subscribe race."""
+    import classroom_interpreter.api.websocket as websocket_module
+
+    client, database, runtime = make_client(tmp_path)
+    repository = SessionRepository(database)
+    with client:
+        session = repository.create_session("WS race", app_version="test")
+        cursor = runtime.publisher.publish(
+            session.id, "session.state", {"marker": "baseline"}
+        )
+        original_replay = websocket_module._replay
+
+        def replay_then_publish(database_arg, session_id, replay_cursor):
+            replayed = original_replay(database_arg, session_id, replay_cursor)
+            runtime.publisher.publish(
+                session_id, "session.state", {"marker": "race-window"}
+            )
+            return replayed
+
+        monkeypatch.setattr(websocket_module, "_replay", replay_then_publish)
+        with client.websocket_connect(
+            f"/ws/sessions/{session.id}?cursor={cursor}"
+        ) as ws:
+            ready = ws.receive_json()
+            assert ready["kind"] == "system.ready"
+            injected = ws.receive_json()
+            assert injected["event_sequence"] == cursor + 1
+            assert injected["payload"] == {"marker": "race-window"}
+            ws.send_text("ping")
+            assert ws.receive_json()["kind"] == "system.pong"
+
+
 def test_health_reflects_components(tmp_path):
     client, database, runtime = make_client(tmp_path)
     with client:
@@ -309,5 +344,4 @@ def test_recovery_lists_and_resumes(tmp_path):
         assert resumed.json()["status"] == "FINALIZING"
         final = wait_for_status(client, session_id, ("SUMMARY_SAVED", "RECOVERY_REQUIRED"))
         assert final["session"]["status"] == "SUMMARY_SAVED"
-
 

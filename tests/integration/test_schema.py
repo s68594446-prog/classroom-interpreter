@@ -15,6 +15,8 @@ EXPECTED_TABLES = {
     "segments",
     "asr_results",
     "translation_results",
+    "translation_context_snapshots",
+    "translation_staged_results",
     "processing_attempts",
     "summary_jobs",
     "agent_heartbeats",
@@ -27,7 +29,7 @@ EXPECTED_TABLES = {
 def test_migration_is_idempotent_and_creates_expected_schema(
     database: Database,
 ) -> None:
-    assert database.migrate() == 4
+    assert database.migrate() == 5
     with database.connect() as connection:
         tables = {
             row["name"]
@@ -56,14 +58,14 @@ def test_migration_three_upgrades_both_experimental_v2_variants(
     (v2_dir / "002_capture.sql").write_text(script)
     path = tmp_path / "upgrade.sqlite3"
     assert Database(path, migrations_dir=v2_dir).migrate() == 2
-    assert Database(path, migrations_dir=source).migrate() == 4
+    assert Database(path, migrations_dir=source).migrate() == 5
     with Database(path).connect() as connection:
         columns = [row["name"] for row in connection.execute(
             "PRAGMA table_info(capture_chunks)")]
         versions = [row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version")]
     assert columns.count("monotonic_clock_id") == 1
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
 
 
 def test_post_purge_metadata_table_has_exact_allowlist(database: Database) -> None:

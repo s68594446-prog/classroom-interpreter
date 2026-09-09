@@ -92,6 +92,34 @@ def _provider_component(request: Request) -> HealthComponent:
     return HealthComponent(name="provider", status=HealthStatus.GREEN, reason_code="OK")
 
 
+def _supervision_component(request: Request) -> HealthComponent:
+    runtime = getattr(request.app.state, "runtime", None)
+    if runtime is None:
+        return HealthComponent(
+            name="runtime-supervision",
+            status=HealthStatus.UNKNOWN,
+            reason_code="NO_RUNTIME",
+        )
+    store = runtime.health_store
+    if runtime.worker_faults:
+        return HealthComponent(
+            name="runtime-supervision",
+            status=HealthStatus.RED,
+            reason_code="WORKER_EXCEPTION_RECORDED",
+        )
+    if store.last_flush_error or store.dropped_samples:
+        return HealthComponent(
+            name="runtime-supervision",
+            status=HealthStatus.YELLOW,
+            reason_code="METRICS_DEGRADED",
+        )
+    return HealthComponent(
+        name="runtime-supervision",
+        status=HealthStatus.GREEN,
+        reason_code="OK",
+    )
+
+
 @router.get("/health/capture")
 def capture_health(request: Request) -> dict:
     # Optional injected backend-owned capture; HTTP reads never acquire microphone.
@@ -113,6 +141,7 @@ def health(request: Request) -> HealthSnapshot:
         _pipeline_component(request, "asr", ("ASR_FAILED",)),
         _pipeline_component(request, "translation", ("TRANSLATION_FAILED",)),
         _provider_component(request),
+        _supervision_component(request),
     )
     if any(c.status is HealthStatus.RED for c in components):
         overall = HealthStatus.RED

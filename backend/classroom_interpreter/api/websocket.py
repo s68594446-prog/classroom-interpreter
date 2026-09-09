@@ -21,6 +21,7 @@ async def session_events(websocket: WebSocket, session_id: str, cursor: int = -1
     database = websocket.app.state.database
     runtime = getattr(websocket.app.state, "runtime", None)
     last = cursor
+    queue = runtime.publisher.subscribe() if runtime is not None else None
 
     async def send(event: WebSocketEvent) -> bool:
         try:
@@ -36,16 +37,16 @@ async def session_events(websocket: WebSocket, session_id: str, cursor: int = -1
         payload={"replayed_after": cursor},
     )
     if not await send(ready):
+        if queue is not None and runtime is not None:
+            runtime.publisher.unsubscribe(queue)
         return
 
     for event in _replay(database, session_id, cursor):
         if not await send(event):
+            if queue is not None and runtime is not None:
+                runtime.publisher.unsubscribe(queue)
             return
         last = max(last, event.event_sequence)
-
-    queue = None
-    if runtime is not None:
-        queue = runtime.publisher.subscribe()
 
     reader = asyncio.create_task(websocket.receive_text())
     try:

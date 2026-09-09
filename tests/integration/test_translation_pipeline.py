@@ -10,7 +10,7 @@ import pytest
 from classroom_interpreter.agents.context import ContextAgent, estimate_tokens
 from classroom_interpreter.agents.segmentation import SegmentAgent, SegmenterConfig
 from classroom_interpreter.agents.transcription import TranscriptionAgent
-from classroom_interpreter.agents.translation import TranslationAgent
+from classroom_interpreter.agents.translation import TranslationAgent, TranslationSequencer
 from classroom_interpreter.domain.models import (
     ContextWindow,
     ProviderError,
@@ -99,8 +99,15 @@ def make_session_with_done_asr(database, tmp_path, utterances=4, *, drain=True):
 
 
 def run_steps(agent, max_steps=200):
+    sequencer = TranslationSequencer(agent.database)
     steps = 0
-    while asyncio.run(agent.step()):
+    while True:
+        worked = asyncio.run(agent.step())
+        released = False
+        while asyncio.run(sequencer.step()):
+            released = True
+        if not worked and not released:
+            break
         steps += 1
         if steps >= max_steps:
             raise AssertionError("worker did not converge")
@@ -283,6 +290,71 @@ def test_translations_commit_in_strict_sequence_order(database, tmp_path):
         ).hexdigest()
 
 
+def test_slow_head_does_not_block_later_translation_processing(database, tmp_path):
+    """Provider work finishes out of order; only public release waits for N."""
+    session_id, base = make_session_with_done_asr(
+        database, tmp_path, utterances=3, drain=False
+    )
+
+    class SlowHead(MockTranslationProvider):
+        def __init__(self):
+            super().__init__()
+            self.release_head = asyncio.Event()
+            self.started = set()
+
+        async def translate(self, request):
+            self.started.add(request.sequence)
+            if request.sequence == 0:
+                await self.release_head.wait()
+            return await super().translate(request)
+
+    provider = SlowHead()
+    workers = [
+        TranslationAgent(
+            database, provider, worker_id=f"parallel-{index}", jitter_fraction=0.0
+        )
+        for index in range(3)
+    ]
+
+    async def exercise():
+        tasks = [asyncio.create_task(worker.step()) for worker in workers]
+        await asyncio.gather(tasks[1], tasks[2])
+        assert not tasks[0].done()
+        with database.connect() as connection:
+            staged = connection.execute(
+                """
+                SELECT segment_sequence FROM translation_staged_results
+                WHERE session_id = ? ORDER BY segment_sequence
+                """,
+                (session_id,),
+            ).fetchall()
+            public = connection.execute(
+                "SELECT COUNT(*) AS n FROM translation_results WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["n"]
+        assert provider.started == {0, 1, 2}
+        assert [row["segment_sequence"] for row in staged] == [1, 2]
+        assert public == 0
+        provider.release_head.set()
+        await tasks[0]
+        sequencer = TranslationSequencer(database)
+        released = 0
+        while await sequencer.step():
+            released += 1
+        assert released == 3
+
+    asyncio.run(exercise())
+    with database.connect() as connection:
+        visible = connection.execute(
+            """
+            SELECT segment_sequence FROM translation_results
+            WHERE session_id = ? ORDER BY segment_sequence
+            """,
+            (session_id,),
+        ).fetchall()
+    assert [row["segment_sequence"] for row in visible] == [0, 1, 2]
+
+
 def test_duplicate_translation_commit_is_idempotent(database, tmp_path):
     from classroom_interpreter.storage.repository import CommitOutcome
 
@@ -311,9 +383,8 @@ def test_duplicate_translation_commit_is_idempotent(database, tmp_path):
     assert outcome is CommitOutcome.ALREADY_COMMITTED
 
 
-def test_failed_translation_blocks_head_of_line_but_later_asr_proceeds(database, tmp_path):
-    """A terminal translation failure blocks ordered commits for that session;
-    no later segment may commit before it (F-011 style fail-closed)."""
+def test_failed_translation_blocks_release_but_not_later_processing(database, tmp_path):
+    """A terminal failure blocks release, while later work is durably staged."""
     calls = {"n": 0}
 
     class FailFirst(MockTranslationProvider):
@@ -335,8 +406,8 @@ def test_failed_translation_blocks_head_of_line_but_later_asr_proceeds(database,
     rows = segment_rows(database, session_id)
     assert rows[0]["state"] == "DONE"
     assert rows[1]["state"] == "TRANSLATION_FAILED"
-    assert rows[2]["state"] == "ASR_DONE"  # never promoted past the blockage
-    assert rows[3]["state"] == "ASR_DONE"
+    assert rows[2]["state"] == "TRANSLATION_PROCESSING"
+    assert rows[3]["state"] == "TRANSLATION_PROCESSING"
     with database.connect() as connection:
         cursor = connection.execute(
             "SELECT next_translation_sequence, last_error_category FROM sessions WHERE id = ?",
@@ -344,6 +415,12 @@ def test_failed_translation_blocks_head_of_line_but_later_asr_proceeds(database,
         ).fetchone()
     assert cursor["next_translation_sequence"] == 1
     assert cursor["last_error_category"] == "AUTH"
+    with database.connect() as connection:
+        staged = connection.execute(
+            "SELECT segment_sequence FROM translation_staged_results WHERE session_id = ? ORDER BY segment_sequence",
+            (session_id,),
+        ).fetchall()
+    assert [row["segment_sequence"] for row in staged] == [2, 3]
 
 
 def test_translation_retry_matrix_then_success(database, tmp_path):
@@ -368,6 +445,80 @@ def test_translation_retry_matrix_then_success(database, tmp_path):
     rows = segment_rows(database, session_id)
     assert rows[0]["state"] == "DONE"
     assert attempts["n"] == 2
+
+
+def test_translation_retry_reuses_first_attempt_context_snapshot(database, tmp_path):
+    session_id, worker = make_session_with_done_asr(
+        database, tmp_path, utterances=3, drain=False
+    )
+
+    class CaptureRetryContext(MockTranslationProvider):
+        def __init__(self):
+            super().__init__()
+            self.context_sequences = []
+
+        async def translate(self, request):
+            self.context_sequences.append(
+                tuple(item.sequence for item in request.context.previous_segments)
+            )
+            if len(self.context_sequences) == 1:
+                raise ProviderFailure(
+                    ProviderError(
+                        category=ProviderErrorCategory.SERVER,
+                        retryable=True,
+                        http_status=500,
+                        safe_message="injected first-attempt failure",
+                    )
+                )
+            return await super().translate(request)
+
+    async def exercise():
+        sequencer = TranslationSequencer(database)
+        # Commit sequence 0, establishing initial context X=(0,).
+        assert await worker.step()
+        assert await sequencer.step()
+
+        # Hold sequence 1 in processing so sequence 2 can make its first attempt
+        # before sequence 1 changes the latest committed context.
+        held_one = worker._repository.claim_next_translation_segment(
+            "held-sequence-one", lease_seconds=60, max_attempts=5
+        )
+        assert held_one is not None and held_one.sequence == 1
+
+        provider = CaptureRetryContext()
+        retrying = TranslationAgent(
+            database,
+            provider,
+            worker_id="retrying-sequence-two",
+            backoff_base_seconds=0.0,
+            jitter_fraction=0.0,
+        )
+        assert await retrying.step()  # sequence 2 fails with snapshot X
+        assert provider.context_sequences == [(0,)]
+
+        # Finish and release sequence 1. A newly built context for sequence 2
+        # is now (0, 1), proving the ambient context changed.
+        await worker._process_claim(held_one)
+        assert await sequencer.step()
+        assert [
+            item.sequence
+            for item in ContextAgent(database).build(session_id, 2).previous_segments
+        ] == [0, 1]
+
+        assert await retrying.step()
+        assert provider.context_sequences == [(0,), (0,)]
+        assert await sequencer.step()
+
+    asyncio.run(exercise())
+    with database.connect() as connection:
+        snapshot_count = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM translation_context_snapshots
+            WHERE session_id = ? AND segment_sequence = 2
+            """,
+            (session_id,),
+        ).fetchone()["n"]
+    assert snapshot_count == 1
 
 
 def test_translation_rate_limit_honors_retry_after(database, tmp_path):

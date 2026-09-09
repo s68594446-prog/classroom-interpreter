@@ -34,6 +34,8 @@ CONTENT_TABLES = (
     "segments",
     "asr_results",
     "translation_results",
+    "translation_context_snapshots",
+    "translation_staged_results",
     "processing_attempts",
     "summary_jobs",
     "summary_chunks",
@@ -244,7 +246,7 @@ def test_duplicate_purge_after_completion_is_noop(tmp_path):
         ).fetchone()["n"] == 1
 
 
-def test_delete_unfinished_session_removes_files_and_rows(tmp_path):
+def test_delete_active_recording_session_is_refused_without_data_loss(tmp_path):
     client, database, runtime = make_client(tmp_path, auto_purge=False)
     with client:
         view = client.post("/api/sessions", json={"course_name": "Unfinished"}).json()
@@ -256,16 +258,61 @@ def test_delete_unfinished_session_removes_files_and_rows(tmp_path):
                 break
             time.sleep(0.1)
         response = client.delete(f"/api/recovery/{session_id}")
-        assert response.status_code == 200
-        assert response.json()["outcome"] == "DELETED"
-    assert not (tmp_path / "data" / "sessions" / session_id).exists()
-    for table in CONTENT_TABLES:
-        assert count_rows(database, table, session_id) == 0
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "PURGE_REFUSED:ACTIVE_RUNTIME_OWNERSHIP: "
+            "stop and enter recovery before deletion"
+        )
+        assert runtime.active_session == session_id
+        assert SessionRepository(database).get_session(session_id).status is SessionStatus.RECORDING
+    assert (tmp_path / "data" / "sessions" / session_id).exists()
+    assert count_rows(database, "capture_chunks", session_id) > 0
     with database.connect() as connection:
         assert connection.execute(
             "SELECT COUNT(*) AS n FROM purged_session_metadata WHERE session_id = ?",
             (session_id,),
         ).fetchone()["n"] == 0  # no summary ever existed
+
+
+def test_delete_recovery_required_session_removes_files_and_rows(tmp_path):
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "Recoverable"}).json()
+        session_id = view["session"]["id"]
+        runtime.active_session = None  # model process loss: runtime no longer owns capture
+        SessionRepository(database).transition_session(
+            session_id,
+            SessionStatus.RECOVERY_REQUIRED,
+            reason_code="TEST_PROCESS_LOSS",
+            actor="test",
+        )
+        response = client.delete(f"/api/recovery/{session_id}")
+        assert response.status_code == 200
+        assert response.json()["outcome"] == "DELETED"
+    assert not (tmp_path / "data" / "sessions" / session_id).exists()
+    for table in CONTENT_TABLES:
+        assert count_rows(database, table, session_id) == 0
+
+
+def test_delete_finalizing_session_is_refused_without_row_loss(tmp_path):
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    repository = SessionRepository(database)
+    with client:
+        record = repository.create_session(
+            "Finalizing", app_version="test"
+        )
+        repository.transition_session(
+            record.id, SessionStatus.RECORDING,
+            reason_code="TEST_START", actor="test",
+        )
+        repository.transition_session(
+            record.id, SessionStatus.FINALIZING,
+            reason_code="TEST_STOP", actor="test",
+        )
+        response = client.delete(f"/api/recovery/{record.id}")
+        assert response.status_code == 409
+        assert "ACTIVE_OR_IN_PROGRESS_SESSION" in response.json()["detail"]
+    assert repository.get_session(record.id).status is SessionStatus.FINALIZING
 
 
 def test_delete_refused_for_saved_summary(tmp_path):
