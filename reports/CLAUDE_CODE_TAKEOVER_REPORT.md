@@ -3,7 +3,7 @@
 **Date:** 2026-09-10
 **Scope:** complete BLOCKING ISSUES 3 and 10; verify the repair candidates for 1–2 and 4–9.
 **Status:** **awaiting independent Codex review. This report does not declare PASS.**
-**Gates:** backend 203 passed · frontend typecheck + build exit 0 · soak reproduced.
+**Gates:** backend 207 passed · frontend typecheck + build exit 0 · soak reproduced.
 
 Every "verified" below means: I read the production code, ran the focused test,
 and re-introduced the original bug to confirm the test turns red. Where a probe
@@ -88,14 +88,14 @@ PYTHONPATH=backend /private/tmp/classroom-phase2-venv.7Ey9Un/bin/python -m pytes
 
 | | |
 |---|---|
-| Result | **203 passed** |
+| Result | **207 passed** |
 | Failures / errors / skips | 0 / 0 / 0 |
 | Warnings | 1 — upstream `starlette/testclient.py:53` `DeprecationWarning` (`anyio.abc.BlockingPortal` alias). Third-party, not project code. |
 | Wall clock | 26.13 s |
 | Python | 3.13.13 |
 
 Baseline at takeover was 189 passed (184 inherited + 5 added in `7e11e82`).
-The count grew to 203 as coverage gaps were closed. Note: passing `-q` twice
+The count grew to 207 as coverage gaps were closed. Note: passing `-q` twice
 (the command line plus `addopts = "-q"`) suppresses the summary line — worth
 knowing when reading CI output from this repo.
 
@@ -563,6 +563,31 @@ convention, so these files are on disk but **not committed**.
 | `soak_pipeline_report_9000s.json` | `169289b5b89b0ad4e31ad6b03cc7bd674b23acc2878c2de2198451689091b4f9` |
 | `soak_pipeline_metrics_9000s.jsonl` | `701ce41c867e4df994f97c7447f44de75f98d0785ed88d20a66836f1061ff37c` |
 | `soak_pipeline_report_smoke_300s.json` | `3fc0ec63c617b78c5f6e956f04277f842b5002bd5f8879a32e482813b716bef6` |
+| `soak_pipeline_report_9000s_postfix.json` | `f6e88379ff57c0047c67f818aca3783145df77c221f00ba77577b4ae7a3d1242` |
+| `soak_pipeline_metrics_9000s_postfix.jsonl` | `193568f785ceeb6dad719a6a00f7ba17d8763a529d53b13e89ccf2f8942c0cdd` |
+
+`SHA256SUMS.txt` covers all five and passes `shasum -a 256 -c`.
+
+### Re-run after the NEW-2 / NEW-4 fixes
+
+The purge path changed, so the full soak was re-run on the final tree
+(`*_postfix` artifacts above):
+
+| | First run | After the fixes |
+|---|---|---|
+| Verdict | pass | **pass** |
+| Segments | 1800 / 1800 | **1800 / 1800** |
+| Duplicates (ASR / translation) | 0 / 0 | **0 / 0** |
+| Source-hash mismatches | 0 | **0** |
+| Staging residue | 0 | **0** |
+| Invalid context hashes | 0 | **0** |
+| DONE prefix kept / tail rebuilt | 700 / 4 | **700 / 4** |
+| SQLite integrity | ok | **ok** |
+| Wall clock | 189.81 s | 188.21 s |
+| Peak RSS | 44.89 MB | 55.69 MB |
+| FDs baseline → final | 7 → 7 | **7 → 7** |
+| **DB size after purge** | 14,319,616 B | **1,363,968 B** |
+| **Recoverable content after exit** | 21,563 EN / 16,166 ZH | **0 / 0** |
 
 The raw run directory (database, capture tree, summary, stdout/stderr) is
 retained at `/private/tmp/classroom-soak/full-9000-20260910-163719`, and the
@@ -674,34 +699,66 @@ existing tested reclaim path rather than inventing a state transition.
 **Mutations:** dropping the release, and releasing regardless of owner, each turn
 one of the two red.
 
-### NEW-2 — Purged classroom content remains readable in the SQLite file *(reported, not fixed)*
+### NEW-2 — Purged content was recoverable in the SQLite file *(FIXED, D-039)*
 
-After a **successful** purge of the 9000 s soak session, the runtime database
-still contains classroom content in freed pages:
+Dropping a row is not deleting it. SQLite returns the row's pages to its
+freelist with the bytes intact, so a purged session's transcripts and
+translations stayed readable in the database file with `strings` even though
+every logical check passed.
 
-| | |
+Measured on the 9000 s soak database **after a successful purge**:
+
+| | Before | After |
+|---|---|---|
+| English ASR occurrences in the file | **21,563** | **0** |
+| Chinese translation occurrences | **16,166** | **0** |
+| `freelist_count` | 3,134 pages | 0 |
+| `PRAGMA secure_delete` | `0` | `1` |
+| File size after purge | 14,319,616 B | **1,363,968 B** |
+| Logical rows (`sessions`, `segments`, `asr_results`, `translation_results`) | 0 | 0 |
+
+**Fix.** Two defences, neither subsuming the other:
+
+- `PRAGMA secure_delete = ON` on every connection, so an ordinary delete zeroes
+  its own bytes without paying to rewrite the file;
+- `CleanupAgent.compact()` — `wal_checkpoint(TRUNCATE)` + `VACUUM` after the
+  purge commits — reclaiming content stranded in free pages by builds older
+  than this rule. The pragma cannot fix that upgrade path, which matters
+  because the owner's existing database already carries such residue.
+
+`compact()` swallows `sqlite3.Error` deliberately: it runs *after* the purge is
+committed and recorded, so a locked database must leave recoverable bytes for
+the next purge rather than turn a completed purge into a reported failure.
+
+**Tests and probes.** My first two probes did **not** go red. The end-to-end
+purge test exercised both defences at once so each covered for the other, and
+the upgrade test called `compact()` directly so deleting its call site missed
+it — neither mechanism was actually pinned. That is the same "name stronger
+than coverage" failure this report criticises elsewhere, so the tests were
+split to isolate one mechanism each. All four probes now fail exactly one named
+test:
+
+| Mutation | Test that fails |
 |---|---|
-| Logical rows (`sessions`, `segments`, `asr_results`, `translation_results`) | **0** — purge is logically correct |
-| English ASR phrase occurrences in the file | **21,563** |
-| Chinese translation phrase occurrences in the file | **16,166** |
-| `freelist_count` | 3,134 pages |
-| `PRAGMA secure_delete` | `0` |
-| `PRAGMA auto_vacuum` | `0` |
-| `VACUUM` in `CleanupAgent` | none |
-| File size after purge | 14,319,616 bytes (unchanged) |
+| remove `secure_delete` | `test_deleted_rows_are_zeroed_without_relying_on_vacuum` |
+| make `compact()` a no-op | `test_purge_reclaims_content_left_in_free_pages_by_earlier_versions` |
+| let `compact()` raise | `test_compact_is_best_effort_and_never_fails_a_completed_purge` |
+| restore the old residue order | `test_purge_refuses_to_finalize_while_manifest_files_remain` |
 
-The purge contract as specified (rows deleted, manifest files unlinked, summary
-retained, session row removed) is **met**. But the project's stated invariant is
-that the only classroom content retained long-term is the final Markdown summary
-plus a content-free metadata ledger, and by that standard deleted-but-recoverable
-transcript and translation bytes are a real gap.
+**A measurement honesty note.** The soak reports
+`purged_content_residue_in_process` but does **not** gate on it. Read from
+inside the running process that figure is 1 (smoke) or 14 (full 9000 s), and it
+is **0 once the interpreter exits** — SQLite completes some page cleanup only
+when the last handle on the file is released, and neither
+`wal_checkpoint(TRUNCATE)` nor `gc.collect()` beats that from inside. I chased
+that number through checkpointing, WAL sidecars and forced collection before
+concluding it is a property of *when* you look, not of what survives. A gate
+must not rest on a measurement point that cannot settle, so the authoritative
+check is the mutation-guarded pytest that measures after teardown. Post-exit
+verification on the full run: **0 English, 0 Chinese** in `runtime.sqlite3`,
+`health.sqlite3`, and both sidecars.
 
-Recommended fix (small, but a data-lifecycle decision, so left to the owner):
-`PRAGMA secure_delete = ON` on the runtime connection, and/or `VACUUM` after a
-successful purge. This warrants a DECISIONS entry and a `DATA_LIFECYCLE.md`
-update rather than a silent change by me.
-
-### NEW-4 — The purge residue check is effectively dead code *(reported, not fixed)*
+### NEW-4 — The purge residue check was dead code *(FIXED, D-040)*
 
 `CleanupAgent.purge` ends its file phase with:
 
@@ -724,10 +781,12 @@ status stays `PURGING`), and the new
 down, accepting either exception and proving it via a simulated silent-unlink
 failure. Removing **both** guards turns it red.
 
-Worth tidying — move the residue check before `_remove_dirs` so the guard is live
-and the failure is a domain error rather than a raw `OSError` — but that reorders
-production purge behaviour, so I left it to the owner rather than changing the
-purge path late in this session.
+**Fixed (D-040).** The residue check now runs *before* `_remove_dirs`, so the
+guard is live and a surviving file produces the domain refusal. The regression
+test was tightened from `pytest.raises((PurgeRefused, OSError))` to
+`pytest.raises(PurgeRefused, match="residue")` — accepting either exception was
+correct while the path was dead, but would now let the ordering regress
+silently. Restoring the old order turns that test red.
 
 ### NEW-3 — Host filesystem was unreliable *(diagnosed; resolved by reboot)*
 
@@ -802,21 +861,17 @@ Both gates that were open when this report was first written are now **closed**:
 | Frontend typecheck / build NOT VERIFIED | **exit 0 / exit 0**, `node_modules` restored |
 | `.env.example` unread | read and manually confirmed — `MIMO_API_KEY=` empty |
 
-Verification state: backend **203 passed** on two independent interpreters
+Verification state: backend **207 passed** on two independent interpreters
 (3.13.13 and a rebuilt 3.14.4 environment), frontend typecheck and build both
 exit 0, soak reproduced after the environment was rebuilt, and the three archived
 soak artifacts pass `shasum -c` against the hashes quoted above.
 
-Two items remain open **by choice**, because both are decisions for the owner
-rather than defects I should settle late in a session:
+**NEW-2 and NEW-4 are now implemented** at the owner's direction (D-039, D-040):
+purged classroom content is unrecoverable rather than merely unreachable, and
+the purge residue guard is live instead of dead code. Both carry
+mutation-verified tests, DECISIONS entries, and a `DATA_LIFECYCLE.md` update.
 
-- **NEW-2** — after a successful purge, transcript and translation bytes are
-  still readable in the runtime SQLite file's free pages. The specified purge
-  contract passes; the "only the summary persists" invariant does not.
-- **NEW-4** — the purge residue check is unreachable (`_remove_dirs` raises
-  first), so an incidental `OSError` is what actually guards finalization.
-
-Say the word on either and I will implement it.
+No findings remain open.
 
 Everything in *Still NOT TESTED* above — real MiMo, a real three-hour
 microphone, permission and device matrices, sleep/wake, real-data purge, Oracle
