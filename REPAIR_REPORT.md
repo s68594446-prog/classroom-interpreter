@@ -9,6 +9,21 @@ This report does not declare any blocking issue resolved. The owner stopped the
 repair run after the most serious checks and will hand remaining work to Zcode.
 All changes are uncommitted. The independent review report is preserved unchanged.
 
+> **Superseded status note (added 2026-09-10, Claude Code takeover).**
+> The historical record above is preserved as written. Two statements in it are
+> no longer current:
+>
+> * "All changes are uncommitted" — those changes were committed as `4948567`
+>   (*partial repair handoff snapshot*), and the further uncommitted work that
+>   followed it was preserved and committed as `8bf3a2c`
+>   (*pre-claude-takeover snapshot*).
+> * The test counts quoted in this report (including "184 passed") are a
+>   snapshot of that run, not of the current tree.
+>
+> Current status, evidence and remaining gaps are in
+> `reports/CLAUDE_CODE_TAKEOVER_REPORT.md`. That report also does not declare
+> a PASS; independent Codex review is still required.
+
 ## Safety checks completed in this shortened run
 
 - Active/owned `RECORDING` deletion is refused with HTTP 409 and capture rows/files remain.
