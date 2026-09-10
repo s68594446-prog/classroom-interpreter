@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -157,6 +159,36 @@ def make_client(
     return client, database, runtime
 
 
+def receive_json_or_fail(ws, timeout=10.0, what="websocket frame"):
+    """`ws.receive_json()` with a deadline.
+
+    Starlette's test websocket blocks forever on an empty receive queue. A
+    lost-event regression (the replay->subscribe race) would therefore hang
+    the suite instead of failing it, which hides the bug in CI. Failing on a
+    deadline keeps the race test red rather than stuck.
+    """
+    # A daemon thread, deliberately not a ThreadPoolExecutor: the pool joins
+    # its workers at shutdown (and at interpreter exit), which would re-hang
+    # on the very frame that never arrives. A daemon thread parked on the
+    # queue cannot block teardown.
+    inbox: "queue.Queue" = queue.Queue(maxsize=1)
+
+    def pump() -> None:
+        try:
+            inbox.put(("ok", ws.receive_json()))
+        except BaseException as exc:  # surfaced below, never swallowed
+            inbox.put(("error", exc))
+
+    threading.Thread(target=pump, daemon=True, name="ws-receive").start()
+    try:
+        kind, value = inbox.get(timeout=timeout)
+    except queue.Empty:
+        pytest.fail(f"timed out after {timeout}s waiting for {what}")
+    if kind == "error":
+        raise value
+    return value
+
+
 def wait_for_status(client, session_id, statuses, timeout=10.0):
     deadline = time.monotonic() + timeout
     last = None
@@ -303,13 +335,18 @@ def test_websocket_buffers_event_published_after_replay_query_before_stream(
         with client.websocket_connect(
             f"/ws/sessions/{session.id}?cursor={cursor}"
         ) as ws:
-            ready = ws.receive_json()
+            ready = receive_json_or_fail(ws, what="system.ready")
             assert ready["kind"] == "system.ready"
-            injected = ws.receive_json()
+            # Mutation that turns this red: subscribe after `_replay` instead
+            # of before it. The injected event then falls in the gap and is
+            # never delivered -- caught here as a timeout, not a hang.
+            injected = receive_json_or_fail(ws, what="event published mid-replay")
             assert injected["event_sequence"] == cursor + 1
             assert injected["payload"] == {"marker": "race-window"}
+            # A pong (not a second copy of the injected event) proves the
+            # buffered replay did not also duplicate it.
             ws.send_text("ping")
-            assert ws.receive_json()["kind"] == "system.pong"
+            assert receive_json_or_fail(ws, what="system.pong")["kind"] == "system.pong"
 
 
 def test_health_reflects_components(tmp_path):
