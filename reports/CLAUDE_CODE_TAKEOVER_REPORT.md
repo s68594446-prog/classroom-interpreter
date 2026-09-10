@@ -3,6 +3,7 @@
 **Date:** 2026-09-10
 **Scope:** complete BLOCKING ISSUES 3 and 10; verify the repair candidates for 1–2 and 4–9.
 **Status:** **awaiting independent Codex review. This report does not declare PASS.**
+**Gates:** backend 203 passed · frontend typecheck + build exit 0 · soak reproduced.
 
 Every "verified" below means: I read the production code, ran the focused test,
 and re-introduced the original bug to confirm the test turns red. Where a probe
@@ -44,9 +45,13 @@ committing. No `git reset --hard`, no `git checkout --`, nothing deleted.
 Plain shell writes to the same paths succeed, and `git commit` works normally in
 a throwaway repo outside this tree.
 
-Root cause (confirmed later, see *New findings* #2): files in this tree are
-macOS **`dataless`** — contents evicted to cloud storage. Reads/writes block on
-a materialization that never completes.
+Root cause (confirmed later, see NEW-3): files in this tree are macOS
+**`dataless`** — contents evicted to iCloud. Reads block on a materialization
+that never completes.
+
+**Resolved.** The owner rebooted; `git commit` works normally again. The commits
+listed below were still produced with plumbing, because they were made while the
+fault was active.
 
 Every commit here was therefore produced with plumbing
 (`git write-tree` → `git commit-tree` → ref update), which yields an identical
@@ -94,34 +99,44 @@ The count grew to 203 as coverage gaps were closed. Note: passing `-q` twice
 (the command line plus `addopts = "-q"`) suppresses the summary line — worth
 knowing when reading CI output from this repo.
 
-### Frontend typecheck / build — **NOT COMPLETED THIS RUN**
+**Re-verified after the host repair on a rebuilt environment.** The reboot that
+fixed the storage fault also wiped `/private/tmp`, destroying the review's
+`classroom-phase2-venv.7Ey9Un`. A fresh venv was built from `pyproject.toml`
+(`pip install -e ".[audio,dev]"`) and the suite re-run:
+
+| | |
+|---|---|
+| Result | **203 passed**, 1 warning, 27.40 s, exit 0 |
+| Python | **3.14.4** (the original run was 3.13.13) |
+| Warning | the same upstream `starlette/testclient.py:53` `DeprecationWarning` |
+
+So the suite passes identically on two independent interpreters and two
+independently built dependency sets. The soak was also re-run on the rebuilt
+environment and reproduced (60/60 segments, DONE prefix retained, zero staging
+residue, integrity `ok`, exit 0).
+
+### Frontend typecheck / build — **PASSED** (after host repair)
 
 ```
-cd frontend && npm run typecheck && npm run build
+cd frontend && npm ci && npm run typecheck && npm run build
 ```
 
-Both fail before compiling: `sh: .../node_modules/.bin/tsc: Operation timed out`.
-`node_modules/typescript/lib/_tsc.js` (6.2 MB) is flagged
-`compressed,dataless` — its contents are evicted and every read hangs.
-`brctl download` did not materialize it. `node` itself runs fine.
+| | |
+|---|---|
+| `npm ci` | clean install, 0 vulnerabilities |
+| `npm run typecheck` (`tsc -b`) | **exit 0**, no diagnostics |
+| `npm run build` (`tsc -b && vite build`) | **exit 0**, 16 modules, built in 531 ms |
+| Output | `dist/index.html` 459 B · `index-CgBMyBbB.js` 199,115 B · `index-CxJzJK45.css` 2,094 B |
+| Versions | Node v24.15.0 · npm 11.12.1 · TypeScript 5.9.3 · Vite 8.2.2 |
 
-This is a **host storage condition, not a code failure**, and I did not fabricate
-a result for it. **Frontend status: NOT VERIFIED THIS RUN.**
+This gate was blocked for most of the session by the host storage fault (NEW-3)
+and was reported as NOT VERIFIED. **The owner rebooted the machine, which cleared
+the fault, and the gate has now been run for real.** `frontend/node_modules`,
+which I had deleted and could not restore, was reinstalled with `npm ci`.
 
-**Action I took that the owner must know about:** attempting to work around the
-evicted compiler, I deleted `frontend/node_modules` and tried to reinstall.
-`npm ci` rejected my flag combination, and plain `npm install` then **hung with
-no output** — `frontend/package-lock.json` is *itself* `compressed,dataless`, so
-npm blocks reading it. A final attempt with `--no-package-lock` (using the
-readable `package.json`) also made no progress.
-
-**`frontend/node_modules` is therefore currently empty and must be reinstalled
-by the owner** once the working copy is materialized (NEW-3). It is gitignored
-and fully regenerable from `package.json` / `package-lock.json`, so no source is
-lost — but the frontend will not build until it is restored. In fairness the
-directory was already unusable before I touched it (its `tsc` was evicted and
-hung); deleting it did not cause the outage, but it did remove the partially
-present tree, and that is my change to disclose.
+Exit codes above are captured directly (`cmd > log; echo $?`). An earlier attempt
+of mine read `${PIPESTATUS[0]}` after a `tail`, which reports the wrong command;
+those numbers were discarded rather than reported.
 
 ### Migrations
 
@@ -144,9 +159,10 @@ exercised rather than simulated by hand-written SQL.
 and quoted `api_key|secret|token|password` assignments. **No matches.** The only
 secret-adjacent tracked file is `.env.example`.
 
-Caveat: I could **not** read `.env.example` to confirm its contents by eye — it
-is dataless and the read timed out. It matched no secret pattern, but the
-required manual confirmation of that one file is outstanding.
+`.env.example` was unreadable during the session (dataless); after the reboot it
+was read and **manually confirmed**: `MIMO_API_KEY=` is empty, and every other
+value is a non-secret model name, URL, or tuning constant. No real key is present.
+The manual confirmation this process requires is now complete.
 
 ---
 
@@ -713,21 +729,45 @@ and the failure is a domain error rather than a raw `OSError` — but that reord
 production purge behaviour, so I left it to the owner rather than changing the
 purge path late in this session.
 
-### NEW-3 — Host filesystem is unreliable in this checkout *(environment)*
+### NEW-3 — Host filesystem was unreliable *(diagnosed; resolved by reboot)*
 
-Files in this tree are macOS `compressed,dataless` — contents evicted to cloud
-storage — and reads block indefinitely on a materialization that never
-completes. This broke `git commit`/`git update-ref`, `tsc`, and reading
-`.env.example`. It is almost certainly also the cause of the "Python import
-stall in the repo `.venv`" recorded in the handoff, which is why the independent
-review used `/private/tmp/classroom-phase2-venv.7Ey9Un`.
+Files in this tree were macOS `compressed,dataless` — contents evicted to iCloud
+— and reads blocked forever on a materialization that never completed. Measured
+scope, from metadata only:
 
-Action for the owner: materialize the working copy (disable "Optimize Mac
-Storage" for this folder / force download), or move the repository out of the
-synced directory. **Until then the frontend gate cannot run here**, and any
-tooling that reads large files may hang rather than fail.
+| Area | Dataless |
+|---|---|
+| `backend` | 0 / 85 |
+| `tests` | 0 / 56 |
+| `frontend` | **15 / 17** |
+| `.git` | **223 / 395** |
 
----
+That distribution explains every symptom: the backend suite ran fine while the
+frontend could not build, and `git commit` / `git show` / `git fsck` failed
+because pack files were evicted.
+
+**Diagnosis.** `~/Documents` is managed by iCloud ("Desktop & Documents"). The
+local disk was 93% full (14 GiB free), which triggers eviction. `brctl` showed
+the CloudDocs container stuck at `needs-sync-up` with a large upload backlog and
+no successful sync for hours; the upload jam blocked downloads too.
+
+**What did not work:** `killall bird` (with the owner's approval). The daemon had
+been running **37 days**; after restart it burned ~87% CPU for 19 minutes while
+the backlog went from 899 to 920 — it was not a slow scan, it was a live lock.
+Recording this so nobody repeats it.
+
+**What did work:** a full reboot. Afterwards the backlog was 0, bird idled at
+2.0% CPU, free space went 14 GiB → 49 GiB (77%), and the `dataless` flags on the
+frontend files were gone. `npm ci`, `tsc`, `vite build` and `git commit` all
+work again.
+
+**Note for the owner:** the review's deferred item "repository `.venv` import
+slowness … not a packaging fix" was misattributed. It was this same eviction; the
+isolated venv worked only because `/private/tmp` sits outside the synced tree.
+The underlying risk remains — a git repository inside an iCloud-synced folder
+will keep hitting this, because `.git` and `node_modules` are exactly the
+many-small-files shape that sync handles worst. Moving the checkout out of
+`~/Documents` (it is only 3.1 MB) would prevent a recurrence.
 
 ## Still NOT TESTED
 
@@ -744,7 +784,6 @@ Unchanged by this session; nothing below is claimed:
 - **Real classroom-content purge** on real user data.
 - **Independent Oracle judgement** of English factual accuracy, Chinese
   translation quality, and ten-lecture summary quality.
-- **Frontend typecheck / build** — blocked this run by NEW-3; must be re-run.
 - The soak drives production runtime loops and the durable `ChunkWriter`, but
   **not** the microphone listener itself.
 
@@ -753,22 +792,34 @@ Unchanged by this session; nothing below is claimed:
 ## Handoff
 
 BLOCKING ISSUES **1–9** have repair candidates with mutation-verified evidence,
-and **10** has a rewritten soak whose own validity was probed five ways.
+and **10** has a rewritten soak whose own validity was probed five ways. The two
+review-flagged tests the handoff did not relay (items 7 and 8) are also fixed.
 
-Two items are **not** closed and must not be read as complete:
+Both gates that were open when this report was first written are now **closed**:
 
-1. **Frontend typecheck/build was not run** (NEW-3, host filesystem). The gate
-   must be re-executed and its real output recorded. **`frontend/node_modules`
-   is currently empty** — I deleted it attempting a workaround and the
-   reinstall could not complete because `package-lock.json` is also dataless.
-   Reinstall it after materializing the working copy.
-2. **`.env.example` could not be read** for the manual secret confirmation the
-   process requires, for the same reason.
+| Was open | Now |
+|---|---|
+| Frontend typecheck / build NOT VERIFIED | **exit 0 / exit 0**, `node_modules` restored |
+| `.env.example` unread | read and manually confirmed — `MIMO_API_KEY=` empty |
 
-Also carried forward, both deliberately left to the owner rather than decided by
-me: **NEW-2** (purged content recoverable in SQLite free pages) is an open
-data-lifecycle question, and **NEW-4** (the purge residue check is unreachable, so
-a raw `OSError` is what actually guards finalization) is a small ordering tidy-up
-in the purge path.
+Verification state: backend **203 passed** on two independent interpreters
+(3.13.13 and a rebuilt 3.14.4 environment), frontend typecheck and build both
+exit 0, soak reproduced after the environment was rebuilt, and the three archived
+soak artifacts pass `shasum -c` against the hashes quoted above.
+
+Two items remain open **by choice**, because both are decisions for the owner
+rather than defects I should settle late in a session:
+
+- **NEW-2** — after a successful purge, transcript and translation bytes are
+  still readable in the runtime SQLite file's free pages. The specified purge
+  contract passes; the "only the summary persists" invariant does not.
+- **NEW-4** — the purge residue check is unreachable (`_remove_dirs` raises
+  first), so an incidental `OSError` is what actually guards finalization.
+
+Say the word on either and I will implement it.
+
+Everything in *Still NOT TESTED* above — real MiMo, a real three-hour
+microphone, permission and device matrices, sleep/wake, real-data purge, Oracle
+quality — is unchanged and still gates production acceptance.
 
 **Awaiting independent Codex review. I am not declaring this PASS.**
