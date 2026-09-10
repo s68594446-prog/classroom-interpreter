@@ -102,11 +102,32 @@ An API success response, non-empty string, or existing filename alone is insuffi
 2. transition to `PURGING`;
 3. delete in idempotent steps and journal only content-free receipts;
 4. remove capture chunks, segments, transcript/translation rows, summary work, retries, debug artifacts, caches, and session-linked content-bearing logs;
-5. verify that all manifest entries are absent;
-6. verify that the final summary still exists and matches;
-7. in one database transaction, insert only `session_id`, `course_name`, `started_at`, `ended_at`, `duration`, `summary_path`, `summary_hash`, `summary_model`, `app_version`, `purged_at`, and `status=PURGED` into `purged_session_metadata`, then delete the temporary session and its cascading content rows.
+5. verify that all manifest entries are absent — **this check runs before directory removal**, so a surviving file raises the domain refusal `PurgeRefused` rather than an incidental `OSError` from `rmdir` (D-040);
+6. remove the now-empty session directories;
+7. verify that the final summary still exists and matches;
+8. in one database transaction, insert only `session_id`, `course_name`, `started_at`, `ended_at`, `duration`, `summary_path`, `summary_hash`, `summary_model`, `app_version`, `purged_at`, and `status=PURGED` into `purged_session_metadata`, then delete the temporary session and its cascading content rows;
+9. compact the database so the deleted content is unrecoverable, not merely unreachable (D-039).
 
 If any step fails, status becomes `RECOVERY_REQUIRED` or remains resumable `PURGING`. Cleanup never broadens its target. Missing temporary files count as already deleted; a missing or changed final summary aborts purge.
+
+### Deleted means unrecoverable
+
+Dropping a row is not enough. SQLite returns the row's pages to its freelist with
+the bytes intact, so a purged session's transcripts and translations stay
+readable in the database file with `strings` long after every logical check
+passes. Two defences apply (D-039):
+
+- every connection sets `PRAGMA secure_delete = ON`, so a delete zeroes its own
+  bytes as it goes;
+- `CleanupAgent.compact()` runs `wal_checkpoint(TRUNCATE)` + `VACUUM` after the
+  purge commits, reclaiming content stranded in free pages by builds older than
+  this rule.
+
+Compaction is best-effort by design: it runs after the purge is committed and
+recorded, so a locked database leaves recoverable bytes for the next purge to
+clear rather than failing a purge that already succeeded. The property is
+verified once the database is at rest — a process still holding a handle can
+observe a small transient count that disappears when the last handle closes.
 
 ## User-requested deletion of unfinished sessions
 

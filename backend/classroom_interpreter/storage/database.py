@@ -31,6 +31,13 @@ class Database:
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
+        # Overwrite deleted content instead of returning it to the freelist
+        # intact. Without this, purged transcripts and translations stay
+        # readable in the file with `strings` long after the rows are gone,
+        # which breaks the retention rule that only the final summary and the
+        # content-free ledger persist (D-039). Applies to deletes made on this
+        # connection, so it must be set on every connection, not once.
+        connection.execute("PRAGMA secure_delete = ON")
         return connection
 
     def migrate(self) -> int:

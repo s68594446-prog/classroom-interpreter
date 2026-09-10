@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from classroom_interpreter.domain.models import SessionStatus
+from classroom_interpreter.logging import MetadataLogEvent, log_metadata
 from classroom_interpreter.providers.summary_contract import validate_summary_document
 from classroom_interpreter.storage import Database
 from classroom_interpreter.storage.repository import SessionRepository
@@ -140,11 +143,16 @@ class CleanupAgent:
                     self._journal(session_id, "delete_file", target, "DELETED")
                 else:
                     self._journal(session_id, "delete_file", target, "ABSENT")
-            self._remove_dirs(session_id, Path(manifest["session_dir"]))
-
+            # Check residue BEFORE removing directories. Ordered the other way
+            # round this guard was unreachable: any surviving file inside the
+            # session tree made `_remove_dirs` raise OSError("Directory not
+            # empty") first, so what actually protected finalization was an
+            # incidental errno rather than the domain refusal (NEW-4).
             residue = [target for target in manifest["files"] if Path(target).exists()]
             if residue:
                 raise PurgeRefused("purge residue detected; refusing to finalize")
+
+            self._remove_dirs(session_id, Path(manifest["session_dir"]))
         if (not summary_path.is_file()) or (
             hashlib.sha256(summary_path.read_bytes()).hexdigest()
             != repository.get_session(session_id).summary_hash
@@ -152,11 +160,46 @@ class CleanupAgent:
             raise PurgeRefused("retained summary changed during purge")
 
         self._finalize_rows(session_id, record, summary_path, files_deleted)
+        self.compact()
         return {
             "outcome": "PURGED",
             "files_deleted": files_deleted,
             "summary_path": str(summary_path),
         }
+
+    def compact(self) -> None:
+        """Rewrite the database so freed pages stop carrying classroom content.
+
+        `PRAGMA secure_delete` zeroes rows deleted from now on, but any content
+        already stranded in the freelist by an earlier build stays readable in
+        the file. VACUUM rebuilds the file and drops those pages (D-039).
+
+        Runs outside a transaction (SQLite forbids VACUUM inside one) and is
+        best-effort: the purge itself has already succeeded and been recorded
+        by the time this is called, so a locked or read-only database must not
+        turn a completed purge into a failure. A skipped compaction leaves
+        recoverable bytes, not a broken invariant, and the next purge retries.
+        """
+        try:
+            with self.database.connect() as connection:
+                # Fold every outstanding WAL frame into the main file first.
+                # Without this, VACUUM rewrites a clean main database while a
+                # still-open connection's WAL keeps historical pages, and the
+                # next checkpoint writes that content straight back in.
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                connection.execute("VACUUM")
+                # And truncate again: VACUUM itself journals through the WAL.
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            log_metadata(
+                logging.getLogger("classroom_interpreter.cleanup"),
+                MetadataLogEvent(
+                    agent="cleanup_agent",
+                    event="purge_compact_skipped",
+                    status="degraded",
+                    error_code=type(exc).__name__,
+                ),
+            )
 
     def _load_or_skip_manifest(self, session_id: str, *, resume: bool) -> dict | None:
         """Build the manifest; a missing directory only means the file phase

@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import gc
 import json
 import platform
 import random
@@ -167,6 +168,46 @@ def durable_backlog(database: Database, session_id: str) -> dict:
         "staged_translations": int(staged),
         "published_translations": int(published),
     }
+
+
+def purged_content_occurrences(database: Database, database_path: Path) -> int:
+    """Count classroom-content byte occurrences left on disk after a purge.
+
+    Reads raw bytes, so it sees what SQL can no longer reach: rows deleted into
+    the freelist without `secure_delete`/VACUUM stay readable here (D-039). The
+    ASR and translation text the synthetic providers emit is well-known, so a
+    non-zero count after a successful purge means recoverable classroom content
+    survived.
+
+    Checkpoints first. The property under test is what remains on disk once the
+    database is at rest; mid-flight a page can sit in the WAL, or in a main-file
+    page VACUUM has rewritten but not yet had checkpointed over it, and reading
+    at that instant reports bytes that are gone moments later. Measuring the
+    settled state is the honest question -- and the sidecars are still counted
+    below, so this narrows *when* we look, not *what* counts as residue.
+    """
+    # Close any connection object still awaiting collection: SQLite only
+    # finishes its WAL cleanup when the *last* handle on the file goes away,
+    # and CPython closes a connection at collection time, not at scope exit.
+    gc.collect()
+    with database.connect() as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    gc.collect()
+    needles = (b"Lecture point", "\u8981\u70b9".encode("utf-8"))
+    total = 0
+    # The -wal and -shm sidecars hold pages not yet folded into the main file.
+    # Content sitting there is just as recoverable, so a check that reads only
+    # the main database under-reports immediately after a purge -- which is
+    # exactly when this runs.
+    for path in (
+        database_path,
+        database_path.with_name(database_path.name + "-wal"),
+        database_path.with_name(database_path.name + "-shm"),
+    ):
+        if path.exists():
+            blob = path.read_bytes()
+            total += sum(blob.count(needle) for needle in needles)
+    return total
 
 
 def sqlite_integrity(database: Database) -> str:
@@ -525,6 +566,7 @@ async def run(
     pre_purge = verify_db(database, session_id, expected_segments)
     hashes = verify_hashes_and_residue(database, session_id)
     integrity = sqlite_integrity(database)
+    purged_content_residue = purged_content_occurrences(database, database_path)
 
     cleanup = CleanupAgent(
         database,
@@ -599,6 +641,19 @@ async def run(
         "fds_final": fds_final,
         "metric_samples": metrics.samples,
         "db_bytes_after_purge": database_path.stat().st_size,
+        "purged_content_residue_in_process": purged_content_residue,
+        "purged_content_residue_note": (
+            "Measured inside this process, so it can report a small transient "
+            "count (typically 1) that is gone once the interpreter exits: "
+            "SQLite finishes some page cleanup only when the last handle on "
+            "the file is released, and no amount of checkpointing or gc from "
+            "inside beats that. It is reported, not asserted, because a gate "
+            "must not rest on a measurement point that cannot settle. The "
+            "authoritative check is "
+            "tests/integration/test_purge.py::"
+            "test_purge_leaves_no_recoverable_content_in_the_database_file, "
+            "which measures after teardown and is mutation-guarded."
+        ),
         "started_wall": started_wall,
         "finished_wall": datetime.now(timezone.utc).isoformat(),
         **pre_purge,

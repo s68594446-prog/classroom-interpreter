@@ -496,7 +496,12 @@ def test_purge_refuses_to_finalize_while_manifest_files_remain(tmp_path, monkeyp
         summaries_root=tmp_path / "data" / "summaries",
         session_store_root=tmp_path / "data" / "sessions",
     )
-    with pytest.raises((PurgeRefused, OSError)):
+    # Must be the domain refusal, not an incidental OSError from rmdir. Before
+    # NEW-4 was fixed the residue check ran *after* `_remove_dirs`, so a
+    # surviving file raised OSError("Directory not empty") first and this
+    # guard was unreachable; asserting the exception type is what keeps the
+    # corrected ordering from silently regressing.
+    with pytest.raises(PurgeRefused, match="residue"):
         cleanup.purge(session_id)
     monkeypatch.undo()
 
@@ -515,3 +520,184 @@ def test_purge_refuses_to_finalize_while_manifest_files_remain(tmp_path, monkeyp
 
     # And a clean retry still completes.
     assert cleanup.purge(session_id)["outcome"] == "PURGED"
+
+
+def _file_occurrences(path: Path, needles: tuple[str, ...]) -> dict[str, int]:
+    """Count raw byte occurrences of each needle in a file.
+
+    Reads the file as bytes, so it sees content in freed pages that SQL can no
+    longer reach.
+    """
+    blob = path.read_bytes()
+    return {n: blob.count(n.encode("utf-8")) for n in needles}
+
+
+def test_purge_leaves_no_recoverable_content_in_the_database_file(tmp_path):
+    """NO PURGE means unrecoverable, not merely unreachable by SQL.
+
+    Deleting rows returns their pages to SQLite's freelist; by default
+    (`secure_delete=0`, `auto_vacuum=0`, no VACUUM) the bytes stay in the file
+    and are trivially recoverable with `strings`. The project's retention rule
+    is that the only classroom content kept long-term is the final Markdown
+    summary plus a content-free metadata ledger, so transcript and translation
+    bytes surviving in free pages violate it even though every logical check
+    passes.
+
+    Mutations that turn this red: drop `PRAGMA secure_delete` from
+    `Database.connect`, or remove the post-purge `VACUUM` in `CleanupAgent`.
+    """
+    client, database, session_id = run_to_purged(tmp_path)
+
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()["n"] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    for table in CONTENT_TABLES:
+        assert count_rows(database, table, session_id) == 0
+
+    # The English ASR text and the Chinese translation the fake providers wrote.
+    hits = _file_occurrences(database.path, ("Lecture point", "要点"))
+    assert hits == {"Lecture point": 0, "要点": 0}, (
+        "purged classroom content is still recoverable from the database file: "
+        f"{hits}"
+    )
+    # The retained ledger must survive; this is not a test that wipes everything.
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM purged_session_metadata WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"] == 1
+
+
+def test_purge_reclaims_content_left_in_free_pages_by_earlier_versions(tmp_path):
+    """Content already stranded in the freelist must also be reclaimed.
+
+    `secure_delete` only zeroes rows deleted *after* it is switched on. A
+    database written by an earlier build (or before D-039) already carries
+    purged transcripts in free pages, and simply enabling the pragma leaves
+    those bytes untouched forever. This models that upgrade path: content is
+    deleted with `secure_delete = OFF`, exactly as an older version would, and
+    a later successful purge must still leave nothing recoverable.
+
+    Mutation that turns this red: remove the post-purge `VACUUM`.
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "Legacy"}).json()
+        legacy_id = view["session"]["id"]
+        assert client.post(f"/api/sessions/{legacy_id}/end").status_code == 200
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if client.get(f"/api/sessions/{legacy_id}").json()["session"]["status"] == "SUMMARY_SAVED":
+                break
+            time.sleep(0.1)
+
+    # Delete the legacy session's content the way an older build would: rows
+    # dropped with secure_delete OFF, leaving the bytes in free pages.
+    import sqlite3 as _sqlite3
+    raw = _sqlite3.connect(database.path)
+    raw.execute("PRAGMA secure_delete = OFF")
+    raw.execute("PRAGMA foreign_keys = OFF")
+    for table in CONTENT_TABLES:
+        raw.execute(f"DELETE FROM {table} WHERE session_id = ?", (legacy_id,))
+    raw.execute("DELETE FROM sessions WHERE id = ?", (legacy_id,))
+    raw.commit()
+    raw.close()
+
+    stranded = _file_occurrences(database.path, ("Lecture point", "要点"))
+    assert stranded["Lecture point"] > 0, (
+        "precondition failed: this test must start with content stranded in "
+        f"free pages, got {stranded}"
+    )
+
+    # A later, ordinary purge of a *different* session must also reclaim it.
+    cleanup = CleanupAgent(
+        database,
+        summaries_root=tmp_path / "data" / "summaries",
+        session_store_root=tmp_path / "data" / "sessions",
+    )
+    cleanup.compact()
+
+    hits = _file_occurrences(database.path, ("Lecture point", "要点"))
+    assert hits == {"Lecture point": 0, "要点": 0}, (
+        f"content stranded by an earlier version survived compaction: {hits}"
+    )
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_deleted_rows_are_zeroed_without_relying_on_vacuum(tmp_path):
+    """`secure_delete` alone must make a delete unrecoverable.
+
+    Split out deliberately. The end-to-end purge test runs both defences
+    (`secure_delete` on the connection and `compact()` afterwards), so removing
+    either one still left it green -- the two mechanisms cover for each other
+    and neither was actually pinned. This test exercises the pragma on its own:
+    rows are deleted and the file is inspected with **no VACUUM**, so it can
+    only pass if the delete itself zeroed the bytes.
+
+    Why both defences are kept: this one keeps ordinary deletes clean without
+    paying to rewrite the file, while `compact()` reclaims content stranded
+    before the pragma existed. Neither subsumes the other.
+
+    Mutation that turns this red: remove `PRAGMA secure_delete` from
+    `Database.connect`.
+    """
+    from classroom_interpreter.storage import Database
+
+    database = Database(tmp_path / "runtime.sqlite3")
+    database.migrate()
+    marker = "SECURE-DELETE-PROBE-Lecture-point-42"
+    with database.connect() as connection:
+        connection.execute("CREATE TABLE probe(x TEXT)")
+        for _ in range(50):
+            connection.execute("INSERT INTO probe VALUES (?)", (marker,))
+        connection.commit()
+    assert _file_occurrences(database.path, (marker,))[marker] > 0
+
+    with database.connect() as connection:
+        connection.execute("DELETE FROM probe")
+        connection.commit()
+    # Deliberately no VACUUM here.
+    assert _file_occurrences(database.path, (marker,)) == {marker: 0}, (
+        "deleted rows are still readable in the file; secure_delete is not "
+        "taking effect on this connection"
+    )
+
+
+def test_compact_is_best_effort_and_never_fails_a_completed_purge(tmp_path):
+    """A locked database must not turn a finished purge into a failure.
+
+    `compact()` runs *after* the purge has been committed and recorded, so if
+    VACUUM cannot get the lock the correct outcome is a content-free warning
+    and recoverable bytes left for next time -- not an exception that makes a
+    completed purge look failed to the caller.
+
+    Mutation that turns this red: let the `sqlite3.Error` propagate out of
+    `compact()`.
+    """
+    import sqlite3 as _sqlite3
+
+    from classroom_interpreter.storage import Database
+
+    database = Database(tmp_path / "runtime.sqlite3")
+    database.migrate()
+    cleanup = CleanupAgent(
+        database,
+        summaries_root=tmp_path / "summaries",
+        session_store_root=tmp_path / "sessions",
+    )
+    blocker = _sqlite3.connect(database.path, timeout=1)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            "INSERT INTO agent_heartbeats(agent_name, instance_id, status, last_seen_at)"
+            " VALUES ('blocker','1','ok',datetime('now'))"
+        )
+        cleanup.compact()  # must not raise
+    finally:
+        blocker.rollback()
+        blocker.close()
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

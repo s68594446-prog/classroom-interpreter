@@ -175,6 +175,29 @@ acceptance or independent verification.
   occurs only after a non-zero durable cursor and measurable queued backlog
   exist; the harness reconstructs agents, invokes boundary rebuild, and records
   pre/post-restart evidence instead of reusing the earlier soak result.
+- **D-039 (Takeover implementation)**: Purge must leave classroom content
+  unrecoverable, not merely unreachable by SQL. Deleting rows returns their
+  pages to SQLite's freelist with the bytes intact, so a purged session's
+  transcripts and translations stayed readable in the database file with
+  `strings` (measured: 21,563 English and 16,166 Chinese occurrences after a
+  *successful* purge). Two defences, neither subsuming the other: every
+  connection sets `PRAGMA secure_delete = ON`, so ordinary deletes zero their
+  own bytes without paying to rewrite the file; and `CleanupAgent.compact()`
+  runs `wal_checkpoint(TRUNCATE)` + `VACUUM` after a purge commits, reclaiming
+  content stranded in free pages by builds that predate this decision.
+  `compact()` is best-effort and swallows `sqlite3.Error`: it runs after the
+  purge is already committed and recorded, so a locked database must leave
+  recoverable bytes for the next purge rather than turn a completed purge into
+  a failure. Verified after teardown, where the file is settled; a check made
+  from inside a live process can still see a small transient count, which the
+  soak reports but does not gate on.
+- **D-040 (Takeover implementation)**: The purge residue check runs *before*
+  directory removal. Ordered the other way it was unreachable — any surviving
+  file inside the session tree made `_remove_dirs` raise
+  `OSError("Directory not empty")` first — so what actually protected
+  finalization was an incidental errno rather than the domain refusal. The
+  guard now raises `PurgeRefused`, and the regression test asserts that type
+  rather than accepting either exception.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 
