@@ -71,6 +71,11 @@ def create_app(
                 asr_provider=asr_provider,
                 translation_provider=translation_provider,
                 summary_provider=summary_provider,
+                # Configured concurrency must reach the orchestrator; the
+                # constructor defaults happen to match the Settings defaults,
+                # so omitting these silently pinned production to 2/2 (D-034).
+                asr_worker_count=resolved_settings.asr_worker_count,
+                translation_worker_count=resolved_settings.translation_worker_count,
             )
         else:
             app.state.runtime = runtime
