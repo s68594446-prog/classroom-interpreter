@@ -128,20 +128,20 @@ def test_translation_commit_is_ordered_per_session_and_idempotent(
     english_b0 = commit_asr(repository, "B", 0, b0.id)
 
     with pytest.raises(OrderingConflict):
-        repository.commit_translation_result(
+        repository.commit_translation_result_direct(
             "A", 1, translation_result(a1.id, english_a1, 1)
         )
 
-    assert repository.commit_translation_result(
+    assert repository.commit_translation_result_direct(
         "B", 0, translation_result(b0.id, english_b0, 0)
     ) is CommitOutcome.CREATED
-    assert repository.commit_translation_result(
+    assert repository.commit_translation_result_direct(
         "A", 0, translation_result(a0.id, english_a0, 0)
     ) is CommitOutcome.CREATED
     a1_result = translation_result(a1.id, english_a1, 1)
-    assert repository.commit_translation_result("A", 1, a1_result) is CommitOutcome.CREATED
+    assert repository.commit_translation_result_direct("A", 1, a1_result) is CommitOutcome.CREATED
     assert (
-        repository.commit_translation_result("A", 1, a1_result)
+        repository.commit_translation_result_direct("A", 1, a1_result)
         is CommitOutcome.ALREADY_COMMITTED
     )
     assert repository.get_session("A").next_translation_sequence == 2
@@ -158,7 +158,7 @@ def test_translation_rejects_wrong_english_source_hash(
         update={"english_text_sha256": "wrong"}
     )
     with pytest.raises(SourceHashMismatch):
-        repository.commit_translation_result(session.id, 0, result)
+        repository.commit_translation_result_direct(session.id, 0, result)
 
 
 def test_translation_cursor_rejects_a_missing_earlier_sequence(
@@ -168,6 +168,6 @@ def test_translation_cursor_rejects_a_missing_earlier_sequence(
     segment = create_processing_segment(repository, tmp_path, session.id, 1)
     english = commit_asr(repository, session.id, 1, segment.id)
     with pytest.raises(OrderingConflict, match="expects translation sequence 0"):
-        repository.commit_translation_result(
+        repository.commit_translation_result_direct(
             session.id, 1, translation_result(segment.id, english, 1)
         )

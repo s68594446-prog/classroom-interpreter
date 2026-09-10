@@ -1249,9 +1249,19 @@ class SessionRepository:
             (category, message, now, row["session_id"]),
         )
 
-    def commit_translation_result(
+    def commit_translation_result_direct(
         self, session_id: str, sequence: int, result: TranslationResult
     ) -> CommitOutcome:
+        """Legacy direct public commit: TEST/REPOSITORY-INTERNAL USE ONLY.
+
+        Production workers must `stage_translation_result` and the
+        `TranslationSequencer` alone releases via
+        `release_next_translation_result`. This direct path is kept for
+        repository-level idempotency/ordering/hash regression tests and
+        potential migration tooling; do not call it from runtime code
+        (D-034). The idempotency, source-hash and ordering guards here are
+        kept intact — they are not weakened shortcuts.
+        """
         now = _now_iso()
         with self.database.transaction() as connection:
             segment = _require_segment(connection, session_id, sequence)

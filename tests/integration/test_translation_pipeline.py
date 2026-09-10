@@ -268,7 +268,7 @@ def test_translations_commit_in_strict_sequence_order(database, tmp_path):
     rows = segment_rows(database, session_id)
     assert all(r["state"] == "DONE" for r in rows)
     # Sequences are contiguous and the durable cursor advanced through all of
-    # them in order; commit_translation_result rejects out-of-order commits.
+    # them in order; commit_translation_result_direct rejects out-of-order commits.
     assert [r["sequence"] for r in rows] == list(range(len(rows)))
     with database.connect() as connection:
         cursor = connection.execute(
@@ -352,7 +352,17 @@ def test_slow_head_does_not_block_later_translation_processing(database, tmp_pat
             """,
             (session_id,),
         ).fetchall()
+        staged_left = connection.execute(
+            "SELECT COUNT(*) AS n FROM translation_staged_results WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"]
+        done_states = connection.execute(
+            "SELECT state, COUNT(*) AS n FROM segments WHERE session_id = ? GROUP BY state",
+            (session_id,),
+        ).fetchall()
     assert [row["segment_sequence"] for row in visible] == [0, 1, 2]
+    assert staged_left == 0
+    assert {row["state"]: row["n"] for row in done_states} == {"DONE": 3}
 
 
 def test_duplicate_translation_commit_is_idempotent(database, tmp_path):
@@ -379,7 +389,7 @@ def test_duplicate_translation_commit_is_idempotent(database, tmp_path):
         latency_ms=1,
         created_at=utc_now(),
     )
-    outcome = repository.commit_translation_result(session_id, 0, replay)
+    outcome = repository.commit_translation_result_direct(session_id, 0, replay)
     assert outcome is CommitOutcome.ALREADY_COMMITTED
 
 
