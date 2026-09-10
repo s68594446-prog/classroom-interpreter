@@ -56,6 +56,8 @@ project is versioned.
 ### Commits made during this takeover
 
 ```
+e01db7a test: fix the two weak tests the handoff did not relay (review items 7 and 8)
+c220939 docs: takeover report for issues 1-10, with the gaps left open
 c68ef13 soak: rewrite the accelerated soak on production orchestration (issue 10)
 547d02f test: cover untested halves of the rebuild (6) and summary temp (8) fixes
 4053f14 test: close coverage gaps in worker isolation (5) and health isolation (9)
@@ -63,6 +65,11 @@ bc402c4 test(ws): make the replay->subscribe race test fail instead of hang
 7e11e82 fix(runtime): pass configured worker counts through create_app
 8bf3a2c pre-claude-takeover snapshot   <- baseline, preserved prior work
 ```
+
+Production code is touched by only two of these: `7e11e82` (the worker-count
+wiring fix) and `c68ef13` (the stale-lease release, NEW-1). Everything after
+`c68ef13` is tests and documentation, so the soak evidence below was produced by
+the same production code that is in the tree now.
 
 ---
 
