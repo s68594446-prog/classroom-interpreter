@@ -339,6 +339,22 @@ class SessionOrchestrator:
         if self._finalize_task is not None and not self._finalize_task.done():
             return self.repository.get_session(session_id)
         await asyncio.to_thread(self.listener.close)
+        await self.stop_workers_for_finalization()
+        self._finalize_task = asyncio.create_task(
+            self._finalize(session_id), name="finalize-drain"
+        )
+        return self.repository.get_session(session_id)
+
+    async def stop_workers_for_finalization(self) -> int:
+        """Stop every worker task, then hand back the leases they died holding.
+
+        A worker cancelled inside a provider call leaves its segment leased
+        for `*_lease_seconds` (120 s). The finalization drain budget is also
+        120 s, so without this the drain can spend its whole budget waiting on
+        leases whose owners are already gone and then summarize an incomplete
+        transcript. Cancellation is awaited first, so every lease released here
+        is provably stale (D-034).
+        """
         self._stop.set()
         for task in self._tasks:
             task.cancel()
@@ -348,10 +364,11 @@ class SessionOrchestrator:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
-        self._finalize_task = asyncio.create_task(
-            self._finalize(session_id), name="finalize-drain"
-        )
-        return self.repository.get_session(session_id)
+        worker_ids = [worker.worker_id for worker in getattr(self, "_asr_workers", [])]
+        worker_ids += [
+            worker.worker_id for worker in getattr(self, "_translation_workers", [])
+        ]
+        return self.repository.expire_leases_for_workers(worker_ids)
 
     async def _finalize(self, session_id: str) -> None:
         """Drain every persisted segment to DONE, then hand over to summary.

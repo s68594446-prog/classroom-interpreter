@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -1248,6 +1249,40 @@ class SessionRepository:
             """,
             (category, message, now, row["session_id"]),
         )
+
+    def expire_leases_for_workers(self, worker_ids: Sequence[str]) -> int:
+        """Mark in-flight leases held by definitively stopped workers as expired.
+
+        When the orchestrator cancels its own worker tasks (End Class, or a
+        soak restart), a worker awaiting a provider response dies holding a
+        lease that runs for `*_lease_seconds` (120 s by default). Nothing else
+        may touch that segment until the lease expires, but the finalization
+        drain has its own 120 s budget -- so the drain can time out waiting for
+        leases that are already known to be dead, and finalize on an incomplete
+        transcript.
+
+        The caller must have already awaited the cancellation of every worker
+        named here, which makes the lease provably stale. Setting
+        `lease_expires_at` to now hands the segment back to the existing,
+        tested reclaim path in the claim queries rather than inventing a new
+        state transition. Leases owned by anyone else are left untouched.
+        """
+        if not worker_ids:
+            return 0
+        now = _now_iso()
+        placeholders = ",".join("?" for _ in worker_ids)
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE segments
+                SET lease_expires_at = ?
+                WHERE lease_owner IN ({placeholders})
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (now, *worker_ids, now),
+            )
+            return cursor.rowcount
 
     def commit_translation_result_direct(
         self, session_id: str, sequence: int, result: TranslationResult

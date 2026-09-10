@@ -5,6 +5,8 @@ import asyncio
 import pytest
 
 from classroom_interpreter.config import Settings
+from classroom_interpreter.domain.models import SegmentState, utc_now
+from classroom_interpreter.storage import SessionRepository
 from classroom_interpreter.runtime.pipeline import SessionOrchestrator
 
 
@@ -64,6 +66,28 @@ def test_segmenter_unexpected_exception_is_recorded_and_loop_continues(
         "count": 1,
         "error_type": "RuntimeError",
     }
+
+
+def _asr_pending_segment(database, tmp_path, session_id, sequence=0):
+    """A segment sitting in ASR_PENDING, ready to be claimed."""
+    repository = SessionRepository(database)
+    segment = repository.create_segment(
+        session_id=session_id,
+        sequence=sequence,
+        start_ms=sequence * 1000,
+        end_ms=(sequence + 1) * 1000,
+        overlap_ms=0,
+        audio_path=tmp_path / f"seg-{sequence}.wav",
+        audio_sha256=f"hash-{sequence}",
+    )
+    repository.transition_segment(
+        session_id,
+        sequence,
+        SegmentState.ASR_PENDING,
+        reason_code="TEST",
+        actor="test",
+    )
+    return segment
 
 
 def _isolation_runtime(database, tmp_path):
@@ -143,3 +167,87 @@ def test_every_worker_loop_isolates_unexpected_exceptions(
     # Content-free: the fault record carries a type and a count, never the
     # exception message or any classroom content.
     assert "probe boom" not in repr(runtime.worker_faults)
+
+
+def test_stopping_workers_releases_leases_they_died_holding(database, tmp_path):
+    """A worker cancelled inside a provider call must not strand its segment.
+
+    Found by the rewritten soak (scripts/soak_pipeline.py), not by review.
+    `end_session` cancels every worker task and then gives `_finalize` a 120s
+    drain budget -- but a worker cancelled mid-request leaves its segment
+    leased for `asr_lease_seconds`, which is also 120s. The drain could
+    therefore spend its entire budget waiting on leases whose owners were
+    already dead, then summarize an incomplete transcript. (The purge gate
+    still held: the summary failed validation and the session went
+    RECOVERY_REQUIRED rather than to a false SUMMARY_SAVED.)
+
+    Cancellation is awaited before the release, so every lease dropped here is
+    provably stale.
+
+    Mutation that turns this red: drop the `expire_leases_for_workers` call
+    from `stop_workers_for_finalization` -- the lease then keeps its original
+    far-future expiry and the segment stays unclaimable.
+    """
+    import helpers_phase3 as h
+
+    session_id = h.make_session(database, "lease-release")
+    repository = SessionRepository(database)
+
+    runtime = _isolation_runtime(database, tmp_path)
+    runtime.active_session = session_id
+    runtime._build_workers(session_id)
+
+    segment = _asr_pending_segment(database, tmp_path, session_id)
+    claimed = repository.claim_next_asr_segment(
+        runtime._asr_workers[0].worker_id, lease_seconds=120, max_attempts=5
+    )
+    assert claimed is not None and claimed.id == segment.id
+
+    with database.connect() as connection:
+        before = connection.execute(
+            "SELECT lease_owner, lease_expires_at FROM segments WHERE id = ?",
+            (segment.id,),
+        ).fetchone()
+    assert before["lease_owner"] == runtime._asr_workers[0].worker_id
+    assert before["lease_expires_at"] > utc_now().isoformat()
+
+    released = asyncio.run(runtime.stop_workers_for_finalization())
+
+    assert released == 1, "the stale lease was not handed back"
+    # The segment is immediately reclaimable by a fresh worker instead of
+    # being stranded for the rest of the lease.
+    reclaimed = repository.claim_next_asr_segment(
+        "fresh-worker", lease_seconds=120, max_attempts=5
+    )
+    assert reclaimed is not None and reclaimed.id == segment.id
+
+
+def test_stopping_workers_leaves_other_sessions_leases_alone(database, tmp_path):
+    """Only leases owned by the stopped workers are released.
+
+    Mutation that turns this red: release every live lease instead of
+    filtering by `lease_owner`, which would let one orchestrator's shutdown
+    steal work in flight elsewhere.
+    """
+    import helpers_phase3 as h
+
+    session_id = h.make_session(database, "other-owner")
+    repository = SessionRepository(database)
+    segment = _asr_pending_segment(database, tmp_path, session_id)
+    repository.claim_next_asr_segment(
+        "somebody-elses-worker", lease_seconds=120, max_attempts=5
+    )
+
+    runtime = _isolation_runtime(database, tmp_path)
+    runtime.active_session = session_id
+    runtime._build_workers(session_id)
+    released = asyncio.run(runtime.stop_workers_for_finalization())
+
+    assert released == 0
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT lease_owner, lease_expires_at FROM segments WHERE id = ?",
+            (segment.id,),
+        ).fetchone()
+    assert row["lease_owner"] == "somebody-elses-worker"
+    assert row["lease_expires_at"] > utc_now().isoformat()
