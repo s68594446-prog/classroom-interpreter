@@ -281,3 +281,46 @@ def test_summary_retry_recovers_temp_left_by_crash_before_rename(tmp_path, monke
     assert not list((tmp_path / "data" / "summaries").glob("*.tmp"))
     record = SessionRepository(database).get_session(session_id)
     assert record.summary_path is not None and Path(record.summary_path).is_file()
+
+
+def test_summary_temp_path_that_is_a_symlink_fails_closed(tmp_path, database):
+    """A `.md.tmp` symlink must abort the write, not be followed.
+
+    Issue 8's fix deletes a leftover regular temp file before retrying. The
+    dangerous variant is a temp path that is a *symlink*: unlinking is fine,
+    but opening or overwriting it would let anything that can create that
+    name redirect a summary write to an arbitrary file. The guard must fail
+    closed and leave the symlink's target untouched.
+
+    Mutation that turns this red: drop the `temporary.is_symlink()` check --
+    the unlink-then-`xb` path then quietly removes the symlink and the write
+    succeeds, so no error is raised.
+    """
+    import os
+
+    agent = make_summary_agent(tmp_path, database)
+    summaries_root = tmp_path / "data" / "summaries"
+    summaries_root.mkdir(parents=True, exist_ok=True)
+
+    session_id = SessionRepository(database).create_session(
+        "Symlink Probe", app_version="test"
+    ).id
+    final_path = agent._summary_path(session_id, "Symlink Probe")
+    temporary = final_path.with_suffix(".md.tmp")
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    os.symlink(victim, temporary)
+    assert temporary.is_symlink()
+
+    document = "# 课程名称：Symlink Probe\n\n" + "\n\n".join(
+        f"## {index + 1}. {title}\n\n- probe" for index, title in enumerate(REQUIRED_SECTIONS)
+    )
+
+    with pytest.raises(SummaryValidationError, match="symlink"):
+        agent._atomic_write(session_id, "Symlink Probe", document)
+
+    # Fail closed: the symlink target is untouched and no summary was created.
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert temporary.is_symlink()
+    assert not final_path.exists()

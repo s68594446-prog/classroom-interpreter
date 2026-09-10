@@ -282,3 +282,117 @@ def test_segment_files_match_checksum_and_repository(tmp_path, database):
         assert row.audio_sha256 == segment.audio_sha256
         assert row.audio_path.exists()
         assert not list(row.audio_path.parent.glob("*.tmp"))
+
+
+def test_rebuild_keeps_contiguous_done_prefix_and_discards_the_rest(
+    database, tmp_path
+):
+    """The retention half of the boundary rebuild (D-035).
+
+    Both existing rebuild tests happen to have an empty DONE prefix, so the
+    "keep what is confirmed, re-derive everything after it" behaviour was
+    never actually exercised. Here three segments are sealed, the first two
+    are marked DONE and the third left mid-pipeline; the rebuild must keep
+    exactly the contiguous DONE prefix, delete the later row *and its audio
+    file*, rewind the translation cursor to the prefix length, and resume VAD
+    at the prefix's confirmed end boundary.
+
+    Mutations that turn this red: keep every segment regardless of state;
+    treat a non-contiguous DONE set as the prefix; leave stale derived files
+    on disk; or fail to rewind next_translation_sequence.
+    """
+    session_id = h.make_session(database, "done-prefix")
+    chunk_dir = tmp_path / "capture" / session_id
+    blocks = h.envelope_blocks([
+        ("speech", 3.0), ("silence", 1.0),
+        ("speech", 3.0), ("silence", 1.0),
+        ("speech", 3.0), ("silence", 1.0),
+    ])
+    h.write_chunks(database, chunk_dir, session_id, blocks, chunk_seconds=10)
+    agent = make_agent(database, tmp_path, session_id)
+    agent.process_available_chunks()
+    agent.seal_tail()
+
+    rows = segment_rows(database, session_id)
+    assert len(rows) == 3, f"expected three sealed segments, got {len(rows)}"
+
+    # Confirm a contiguous DONE prefix of two; sequence 2 stays unconfirmed.
+    with database.transaction() as connection:
+        for row in rows[:2]:
+            connection.execute(
+                "UPDATE segments SET state = 'DONE' WHERE id = ?", (row["id"],)
+            )
+        connection.execute(
+            "UPDATE sessions SET next_translation_sequence = 3 WHERE id = ?",
+            (session_id,),
+        )
+    kept_paths = [Path(row["audio_path"]) for row in rows[:2]]
+    discarded_path = Path(rows[2]["audio_path"])
+    assert all(path.is_file() for path in kept_paths)
+    assert discarded_path.is_file()
+    prefix_boundary = int(rows[1]["end_ms"])
+
+    evidence = make_agent(database, tmp_path, session_id).rebuild_unconfirmed_tail()
+
+    assert evidence == {
+        "kept_done_segments": 2,
+        "removed_unconfirmed_segments": 1,
+        "restart_boundary_ms": prefix_boundary,
+    }
+    surviving = segment_rows(database, session_id)
+    assert [row["sequence"] for row in surviving] == [0, 1]
+    assert all(row["state"] == "DONE" for row in surviving)
+    # Confirmed audio is retained; the unconfirmed tail's file is gone.
+    assert all(path.is_file() for path in kept_paths)
+    assert not discarded_path.exists()
+
+    with database.connect() as connection:
+        cursor_row = connection.execute(
+            "SELECT next_translation_sequence FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        audits = connection.execute(
+            "SELECT COUNT(*) AS n FROM state_transition_audits WHERE entity_id = ?",
+            (rows[2]["id"],),
+        ).fetchone()["n"]
+    assert cursor_row["next_translation_sequence"] == 2
+    assert audits == 0, "audit rows for the discarded segment must be removed"
+
+
+def test_rebuild_does_not_trust_a_non_contiguous_done_set(database, tmp_path):
+    """A DONE segment *after* a gap is not part of the trusted prefix.
+
+    Mutation that turns this red: select DONE segments with a filter instead
+    of walking the contiguous prefix -- sequence 2 would then be kept even
+    though sequence 1 never completed, silently promoting unconfirmed work.
+    """
+    session_id = h.make_session(database, "gap-prefix")
+    chunk_dir = tmp_path / "capture" / session_id
+    blocks = h.envelope_blocks([
+        ("speech", 3.0), ("silence", 1.0),
+        ("speech", 3.0), ("silence", 1.0),
+        ("speech", 3.0), ("silence", 1.0),
+    ])
+    h.write_chunks(database, chunk_dir, session_id, blocks, chunk_seconds=10)
+    agent = make_agent(database, tmp_path, session_id)
+    agent.process_available_chunks()
+    agent.seal_tail()
+    rows = segment_rows(database, session_id)
+    assert len(rows) == 3
+
+    # DONE at sequences 0 and 2, but 1 is still in flight: the trusted prefix
+    # is only sequence 0.
+    with database.transaction() as connection:
+        for index in (0, 2):
+            connection.execute(
+                "UPDATE segments SET state = 'DONE' WHERE id = ?",
+                (rows[index]["id"],),
+            )
+
+    evidence = make_agent(database, tmp_path, session_id).rebuild_unconfirmed_tail()
+
+    assert evidence["kept_done_segments"] == 1
+    assert evidence["removed_unconfirmed_segments"] == 2
+    assert evidence["restart_boundary_ms"] == int(rows[0]["end_ms"])
+    assert [row["sequence"] for row in segment_rows(database, session_id)] == [0]
+    assert not Path(rows[2]["audio_path"]).exists()
