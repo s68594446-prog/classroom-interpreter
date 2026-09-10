@@ -346,3 +346,172 @@ def test_purge_journal_is_content_free(tmp_path):
         text = " ".join((row["step"], row["target"], row["outcome"]))
         assert "课程" not in text  # no classroom content in targets/outcomes
         assert ".md" not in row["target"]  # summaries never appear as targets
+
+
+@pytest.mark.parametrize("boundary", ["mid_file_deletion", "before_row_finalization"])
+def test_purge_resumes_after_interrupting_the_real_implementation(tmp_path, monkeypatch, boundary):
+    """Interrupt the actual purge, then finish it from a fresh agent.
+
+    The independent review judged `test_partial_purge_resumes_to_completion`
+    only partially credible: it deletes files by hand and re-runs purge, so it
+    proves missing-file idempotency but never interrupts the real
+    implementation at a journal / files / rows boundary. This test injects the
+    failure *inside* `CleanupAgent.purge` at each boundary, then resumes with a
+    newly constructed agent (modelling a restarted process reading only durable
+    state).
+
+    Mutations that turn this red: finalize the metadata/rows before the files
+    are provably gone; drop the `resume=` handling in `_load_or_skip_manifest`
+    so a second pass cannot rebuild its work; or let the residue check pass
+    with files still present.
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "Resume"}).json()
+        session_id = view["session"]["id"]
+        client.post(f"/api/sessions/{session_id}/end")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/sessions/{session_id}").json()["session"]["status"]
+            if status == "SUMMARY_SAVED":
+                break
+            time.sleep(0.1)
+    repository = SessionRepository(database)
+    record = repository.get_session(session_id)
+    assert record.status is SessionStatus.SUMMARY_SAVED
+    summary_path = Path(record.summary_path)
+    summary_bytes = summary_path.read_bytes()
+    session_dir = tmp_path / "data" / "sessions" / session_id
+
+    def make_agent():
+        return CleanupAgent(
+            database,
+            summaries_root=tmp_path / "data" / "summaries",
+            session_store_root=tmp_path / "data" / "sessions",
+        )
+
+    # ---- interrupt the real purge at the chosen boundary
+    if boundary == "mid_file_deletion":
+        real_unlink = Path.unlink
+        calls = {"n": 0}
+
+        def failing_unlink(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected crash mid file deletion")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+    else:
+        def failing_finalize(self, *args, **kwargs):
+            raise RuntimeError("injected crash before row finalization")
+
+        monkeypatch.setattr(CleanupAgent, "_finalize_rows", failing_finalize)
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        make_agent().purge(session_id)
+
+    monkeypatch.undo()
+
+    # Nothing may be finalized yet: the ledger row must not exist and the
+    # session row must survive, or a crash would have destroyed the evidence
+    # needed to finish.
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM purged_session_metadata WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()["n"] == 1
+    assert repository.get_session(session_id).status is SessionStatus.PURGING
+    # The retained summary is untouched by the interrupted pass.
+    assert summary_path.read_bytes() == summary_bytes
+
+    # ---- resume from a fresh agent, as a restarted process would
+    receipt = make_agent().purge(session_id)
+
+    assert receipt["outcome"] == "PURGED"
+    assert not session_dir.exists()
+    assert summary_path.read_bytes() == summary_bytes
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM purged_session_metadata WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()["n"] == 0
+    for table in CONTENT_TABLES:
+        assert count_rows(database, table, session_id) == 0
+
+
+def test_purge_refuses_to_finalize_while_manifest_files_remain(tmp_path, monkeypatch):
+    """Purge must not finalize rows/ledger while manifest files still exist.
+
+    Found while mutation-probing the purge-resume tests: deleting the explicit
+    `residue` check in `CleanupAgent.purge` broke no test. Investigating that
+    showed the check is in practice unreachable for files inside the session
+    tree -- `_remove_dirs` hits `OSError: Directory not empty` first -- so the
+    guard that actually holds this line today is an incidental OSError, not the
+    domain refusal (see NEW-4 in the takeover report).
+
+    This test therefore asserts the *invariant* rather than one exception type:
+    whichever guard fires, purge must abort with content still on disk, no
+    ledger row, the session row intact, and the session left resumable. A silent
+    unlink failure must never let the session row disappear while capture audio
+    and transcripts stay on disk -- content retained with no owning row to find
+    it by.
+
+    Mutation that turns this red: allow finalization to proceed when manifest
+    files remain (remove both the residue check and the directory removal).
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "Residue"}).json()
+        session_id = view["session"]["id"]
+        client.post(f"/api/sessions/{session_id}/end")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/sessions/{session_id}").json()["session"]["status"]
+            if status == "SUMMARY_SAVED":
+                break
+            time.sleep(0.1)
+    repository = SessionRepository(database)
+    assert repository.get_session(session_id).status is SessionStatus.SUMMARY_SAVED
+
+    # Model a silent unlink failure: the call "succeeds" but the file survives.
+    real_unlink = Path.unlink
+    survivor = {"path": None}
+
+    def lying_unlink(self, *args, **kwargs):
+        if survivor["path"] is None:
+            survivor["path"] = self
+            return None  # pretend the delete worked
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", lying_unlink)
+    cleanup = CleanupAgent(
+        database,
+        summaries_root=tmp_path / "data" / "summaries",
+        session_store_root=tmp_path / "data" / "sessions",
+    )
+    with pytest.raises((PurgeRefused, OSError)):
+        cleanup.purge(session_id)
+    monkeypatch.undo()
+
+    assert survivor["path"] is not None and survivor["path"].exists()
+    # Fail closed: no ledger row, session row intact, still PURGING so a later
+    # pass can finish the job.
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM purged_session_metadata WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()["n"] == 1
+    assert repository.get_session(session_id).status is SessionStatus.PURGING
+
+    # And a clean retry still completes.
+    assert cleanup.purge(session_id)["outcome"] == "PURGED"

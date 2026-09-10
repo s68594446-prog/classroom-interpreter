@@ -76,14 +76,14 @@ PYTHONPATH=backend /private/tmp/classroom-phase2-venv.7Ey9Un/bin/python -m pytes
 
 | | |
 |---|---|
-| Result | **200 passed** |
+| Result | **203 passed** |
 | Failures / errors / skips | 0 / 0 / 0 |
 | Warnings | 1 — upstream `starlette/testclient.py:53` `DeprecationWarning` (`anyio.abc.BlockingPortal` alias). Third-party, not project code. |
-| Wall clock | 26.97 s |
+| Wall clock | 26.13 s |
 | Python | 3.13.13 |
 
 Baseline at takeover was 189 passed (184 inherited + 5 added in `7e11e82`).
-The count grew to 200 as coverage gaps were closed. Note: passing `-q` twice
+The count grew to 203 as coverage gaps were closed. Note: passing `-q` twice
 (the command line plus `addopts = "-q"`) suppresses the summary line — worth
 knowing when reading CI output from this repo.
 
@@ -551,6 +551,71 @@ Old Phase 9 reports were not overwritten, reused, or cited.
 
 ---
 
+## Cross-check against the primary review document
+
+I initially worked from the handoff's summary of the ten issues plus direct code
+reading. `reports/INDEPENDENT_REVIEW_2026-09-08.md` turned out to be readable
+(most other docs in `reports/` are dataless), so I read it and cross-checked.
+
+Two things the handoff did not relay:
+
+**The review's TEST QUALITY section flags eight tests, not five.** The handoff
+listed translation ordering, segment crash recovery, summary atomic write,
+WebSocket replay and the old soak. The review also assesses
+`test_source_hash_mismatch_fails_closed` (verdict **credible**, no action),
+`test_purge_refuses_tampered_summary` (**credible** for the hash gate, no
+action), `test_partial_purge_resumes_to_completion` (**partially credible**) and
+`test_sqlite_busy_never_loses_work` (**too permissive**). The last two were still
+unaddressed in the tree; both are now fixed (below).
+
+**The review's deferred list blames the wrong cause for one item.** It records
+"Repository `.venv` import slowness; isolated venv is the current workaround, not
+a packaging fix." That is not a packaging problem — it is the same `dataless`
+file eviction described in NEW-3. The isolated venv works because it lives in
+`/private/tmp`, outside the synced tree.
+
+### Review test-quality item 8 — `test_sqlite_busy_never_loses_work` *(fixed)*
+
+The review called its assertion "too permissive for recovery success": after
+releasing the lock it accepted **either** `SUMMARY_SAVED` **or**
+`RECOVERY_REQUIRED`, so a work item could fail to recover and the test still
+passed. This is precisely the assertion shape the handoff forbids, and it was
+still in the tree.
+
+Tightened to require `SUMMARY_SAVED`, plus explicit no-work-lost checks (every
+segment `DONE`, one `asr_results` row per segment). It passes **5/5** runs
+unmutated, so the system genuinely recovers — the old assertion was simply
+hiding the question.
+
+**Decisive probe.** With the *same* production failure injected (finalization
+forced to end in `RECOVERY_REQUIRED`):
+
+| Assertion | Result |
+|---|---|
+| Original permissive (`in (SUMMARY_SAVED, RECOVERY_REQUIRED)`) | **passed** |
+| Tightened (`== SUMMARY_SAVED` + no-work-lost) | **failed** |
+
+The review's other criticism of this test — that it "does not stress a Health
+Monitor metrics writer against pipeline writes" — is covered by the new issue-9
+tests rather than by overloading this one.
+
+### Review test-quality item 7 — `test_partial_purge_resumes_to_completion` *(fixed)*
+
+The review judged it partially credible: it deletes files by hand and re-runs
+purge, proving missing-file idempotency but never interrupting the real
+implementation at a journal / files / rows boundary.
+
+Added `test_purge_resumes_after_interrupting_the_real_implementation`,
+parametrized over two boundaries **inside** `CleanupAgent.purge`:
+`mid_file_deletion` (crash on the second `unlink`) and `before_row_finalization`
+(crash entering `_finalize_rows`). After each, it asserts nothing was finalized
+(no ledger row, session row intact, status still `PURGING`, summary byte-identical),
+then resumes with a **freshly constructed agent** — modelling a restarted process
+reading only durable state — and asserts full completion.
+
+**Mutation:** making `PURGING` non-resumable turns all three purge-resume tests
+red. The original test is kept, not weakened.
+
 ## New findings
 
 Issues found outside the original ten. **#1 was fixed because it blocked issue 10;
@@ -613,6 +678,34 @@ Recommended fix (small, but a data-lifecycle decision, so left to the owner):
 successful purge. This warrants a DECISIONS entry and a `DATA_LIFECYCLE.md`
 update rather than a silent change by me.
 
+### NEW-4 — The purge residue check is effectively dead code *(reported, not fixed)*
+
+`CleanupAgent.purge` ends its file phase with:
+
+```python
+self._remove_dirs(session_id, Path(manifest["session_dir"]))
+residue = [target for target in manifest["files"] if Path(target).exists()]
+if residue:
+    raise PurgeRefused("purge residue detected; refusing to finalize")
+```
+
+Deleting that check breaks no test. Investigating why: for any manifest file
+inside the session tree, `_remove_dirs` raises `OSError: Errno 66 Directory not
+empty` **first**, so the domain refusal is unreachable in practice. What actually
+holds the "do not finalize while content remains" line today is an incidental,
+unhandled `OSError` escaping to the caller — not `PurgeRefused`.
+
+The invariant still holds (purge aborts, no ledger row, session row intact,
+status stays `PURGING`), and the new
+`test_purge_refuses_to_finalize_while_manifest_files_remain` pins that invariant
+down, accepting either exception and proving it via a simulated silent-unlink
+failure. Removing **both** guards turns it red.
+
+Worth tidying — move the residue check before `_remove_dirs` so the guard is live
+and the failure is a domain error rather than a raw `OSError` — but that reorders
+production purge behaviour, so I left it to the owner rather than changing the
+purge path late in this session.
+
 ### NEW-3 — Host filesystem is unreliable in this checkout *(environment)*
 
 Files in this tree are macOS `compressed,dataless` — contents evicted to cloud
@@ -665,7 +758,10 @@ Two items are **not** closed and must not be read as complete:
 2. **`.env.example` could not be read** for the manual secret confirmation the
    process requires, for the same reason.
 
-Also carried forward: **NEW-2** (purged content recoverable in SQLite free pages)
-is an open data-lifecycle question I deliberately did not decide.
+Also carried forward, both deliberately left to the owner rather than decided by
+me: **NEW-2** (purged content recoverable in SQLite free pages) is an open
+data-lifecycle question, and **NEW-4** (the purge residue check is unreachable, so
+a raw `OSError` is what actually guards finalization) is a small ordering tidy-up
+in the purge path.
 
 **Awaiting independent Codex review. I am not declaring this PASS.**

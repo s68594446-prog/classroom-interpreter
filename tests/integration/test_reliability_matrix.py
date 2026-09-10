@@ -221,10 +221,35 @@ def test_sqlite_busy_never_loses_work(tmp_path):
             if status in ("SUMMARY_SAVED", "RECOVERY_REQUIRED"):
                 break
             time.sleep(0.1)
-        assert status in ("SUMMARY_SAVED", "RECOVERY_REQUIRED")
+        # The contract is "never loses work": once the external lock is gone the
+        # blocked claim must be retried and the class must finish. Accepting
+        # RECOVERY_REQUIRED here (as this test used to) let a genuine failure to
+        # recover pass silently -- the independent review called this assertion
+        # "too permissive for recovery success", and it is the one shape of
+        # assertion this project forbids.
+        assert status == "SUMMARY_SAVED", (
+            "a transient SQLite busy lock must not cost the class its summary; "
+            f"ended in {status}"
+        )
         with database.connect() as connection:
             bad = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            states = {
+                row["state"]: row["n"]
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS n FROM segments "
+                    "WHERE session_id = ? GROUP BY state",
+                    (session_id,),
+                ).fetchall()
+            }
+            transcribed = connection.execute(
+                "SELECT COUNT(*) AS n FROM asr_results WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["n"]
         assert bad == "ok"
+        # No work lost: every segment reached DONE and each one kept its
+        # transcript, including the segment whose claim hit the busy lock.
+        assert states and set(states) == {"DONE"}, f"unfinished segments: {states}"
+        assert transcribed == states["DONE"]
 
 
 def test_summary_write_failure_refuses_saved_then_recovers(tmp_path):
