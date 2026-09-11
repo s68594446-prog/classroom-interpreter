@@ -8,12 +8,16 @@ import pytest
 
 from classroom_interpreter.domain.models import (
     AudioSegmentRef,
+    ContextWindow,
     ProviderErrorCategory,
+    TranslationRequest,
 )
 from classroom_interpreter.providers.errors import ProviderFailure
 from classroom_interpreter.providers.mimo import (
     MAX_ENCODED_AUDIO_BYTES,
     MimoASRProvider,
+    MimoTranslationProvider,
+    ProviderHttpResponse,
     build_asr_payload,
     classify_http_status,
     parse_asr_response,
@@ -235,3 +239,141 @@ def test_transcribe_http_error_classification(tmp_path):
         asyncio.run(provider.transcribe(make_ref(tmp_path)))
     assert excinfo.value.error.category is ProviderErrorCategory.AUTH
     assert excinfo.value.error.retryable is False
+
+
+# --- Real-API-shape regressions (recorded from the live provider 2026-09-11) ---
+#
+# Every raw string below was returned by the production `mimo-v2.5-asr`
+# endpoint for real synthesized lecture audio. They are kept verbatim so the
+# parser is pinned to what the provider actually emits, not to what the docs
+# describe.
+
+REAL_ASR_CONTENT_SAMPLES = [
+    # Same request shape, three different wrappers -- it is not stable per call.
+    (
+        "think>\n<chinese> Today we will derive the Black-Scholes equation from "
+        "first principles. Value at risk measures the worst expected loss at a "
+        "given confidence level.",
+        "Today we will derive the Black-Scholes equation from first principles. "
+        "Value at risk measures the worst expected loss at a given confidence level.",
+    ),
+    ("<chinese> Good morning, everyone.", "Good morning, everyone."),
+    (
+        " The portfolio beta is 1.35, and the annualized volatility reached 22% in Q3 2024.",
+        "The portfolio beta is 1.35, and the annualized volatility reached 22% in Q3 2024.",
+    ),
+]
+
+
+@pytest.mark.parametrize("raw,expected", REAL_ASR_CONTENT_SAMPLES)
+def test_asr_parser_strips_real_chat_template_scaffolding(raw, expected):
+    """The English transcript is the factual source for the summary.
+
+    Scaffolding tokens the ASR chat template emits must never reach it. These
+    wrappers cannot be disabled at the request level: `thinking.type=disabled`
+    and `chat_template_kwargs.enable_thinking=False` both still produced them
+    against the live API (they do work for the text models), so stripping here
+    is the only place this can be fixed.
+
+    Mutation that turns this red: return `text.strip()` from
+    `parse_asr_response` without calling `strip_asr_scaffolding`.
+    """
+    body = json.dumps(
+        {"id": "req-1", "choices": [{"message": {"content": raw}}]}
+    ).encode()
+    text, request_id = parse_asr_response(body)
+    assert text == expected
+    assert request_id == "req-1"
+
+
+@pytest.mark.parametrize(
+    "spoken",
+    [
+        "Now think about what the theorem actually means.",
+        "We use <english> tags when parsing XML documents.",
+        "1. Consider a European call option with strike price K.",
+        "The chinese economy grew last quarter.",
+    ],
+)
+def test_asr_parser_never_edits_the_lecturer_s_own_words(spoken):
+    """Stripping must not chew into real speech.
+
+    The guard only removes a known tag when the remaining text *starts* with
+    it, so words like "think" or a spoken "<english>" mid-sentence survive
+    intact. A transcript that silently loses its first clause would corrupt the
+    summary while every other check still passed.
+
+    Mutation that turns this red: match these markers anywhere in the string
+    (e.g. `replace()` instead of a prefix test).
+    """
+    body = json.dumps(
+        {"id": "r", "choices": [{"message": {"content": spoken}}]}
+    ).encode()
+    text, _ = parse_asr_response(body)
+    assert text == spoken
+
+
+def test_translation_payload_disables_provider_side_reasoning():
+    """Translation must ship the one thinking-off spelling that works.
+
+    Measured live on 2026-09-11: default reasoning put p50 latency at 5.40s
+    (max 8.31s) and ~152 completion tokens per segment; with this flag the same
+    five sentences ran at p50 2.29s (max 2.54s) and ~14 tokens, with no quality
+    loss. A five-second-late caption is not realtime, so this is a correctness
+    property of the feature, not a tuning preference.
+
+    Only this spelling takes effect -- top-level `enable_thinking` and
+    `reasoning_effort` were both ignored by the provider.
+
+    Mutation that turns this red: drop `**NO_THINKING` from the payload.
+    """
+    captured: dict = {}
+
+    async def fake_post(url, headers, payload):
+        captured.update(payload)
+        return ProviderHttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {"id": "x", "choices": [{"message": {"content": "测试译文。"}}]}
+            ).encode(),
+        )
+
+    provider = MimoTranslationProvider(
+        api_key="test-key",
+        model="mimo-v2.5",
+        base_url="https://example.invalid/v1",
+        post=fake_post,
+    )
+    request = TranslationRequest(
+        segment_id="seg-1",
+        session_id="sess-1",
+        sequence=0,
+        current_english_text="Hello.",
+        context=ContextWindow(
+            session_id="sess-1",
+            current_segment_id="seg-1",
+            previous_segments=(),
+            window_start_ms=0,
+            window_end_ms=1000,
+            estimated_tokens=4,
+            current_english_text="Hello.",
+        ),
+    )
+    asyncio.run(provider.translate(request))
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_summary_keeps_provider_side_reasoning():
+    """Summary is offline and quality-sensitive, so it must NOT disable thinking.
+
+    Pins the deliberate asymmetry with translation: if someone later applies
+    NO_THINKING globally "for consistency", the summary silently loses its
+    reasoning budget for no latency benefit -- nobody is waiting on it live.
+    """
+    import inspect
+
+    from classroom_interpreter.providers import mimo as mimo_module
+
+    source = inspect.getsource(mimo_module.MimoSummaryProvider)
+    assert "NO_THINKING" not in source

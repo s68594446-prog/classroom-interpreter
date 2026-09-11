@@ -147,7 +147,45 @@ def parse_asr_response(body: bytes) -> tuple[str, str | None]:
     text = message.get("content")
     if not isinstance(text, str) or not text.strip():
         raise _malformed("response content is empty or non-text")
-    return text.strip(), request_id
+    return strip_asr_scaffolding(text), request_id
+
+
+# Chat-template scaffolding the real `mimo-v2.5-asr` model emits around the
+# transcript. Measured against the live API on 2026-09-11: the same audio can
+# come back as `<chinese> Good morning, everyone.`, as
+# `think>\n<chinese> Today we will...` (an unbalanced `</think>` remnant), or
+# with no wrapper at all. It is not stable per-request, and it cannot be turned
+# off -- `thinking.type=disabled` and `chat_template_kwargs.enable_thinking`
+# both still produce it (they do work for the text models). Left in place these
+# tokens enter the English transcript, which is the factual source for the
+# summary, so they are stripped here rather than downstream.
+_ASR_OPEN_TAGS = ("<chinese>", "<english>", "<transcript>", "<think>")
+_ASR_THINK_CLOSE = "think>"
+
+
+def strip_asr_scaffolding(text: str) -> str:
+    """Remove chat-template scaffolding from an ASR transcript.
+
+    Conservative by construction: it only removes a known tag when that tag is
+    what the remaining text *starts* with, and it never touches the interior of
+    the transcript. A lecturer who says "think about the English tag" keeps
+    every word, because nothing here matches mid-string content.
+    """
+    result = text.strip()
+    # Drop a leading `</think>` / `think>` remnant plus anything ahead of it.
+    head, sep, tail = result.partition(_ASR_THINK_CLOSE)
+    if sep and not head.strip(" \t\n<>/"):
+        result = tail.lstrip()
+    changed = True
+    while changed:
+        changed = False
+        lowered = result.lstrip().lower()
+        for tag in _ASR_OPEN_TAGS:
+            if lowered.startswith(tag):
+                result = result.lstrip()[len(tag):].lstrip()
+                changed = True
+                break
+    return result.strip()
 
 
 def _malformed(reason: str) -> ProviderFailure:
@@ -383,6 +421,19 @@ def validate_translation_output(text: str, source_english: str) -> str:
     return cleaned
 
 
+# `mimo-v2.5` is a reasoning model: by default it spends most of its budget in
+# `reasoning_content` before answering. Measured against the live API on
+# 2026-09-11 over five lecture sentences, disabling that cut p50 latency from
+# 5.40s to 2.29s (max 8.31s -> 2.54s) and completion tokens from ~152 to ~14,
+# with no loss of translation quality on any sample -- sentence translation is
+# not a task that needs deliberation, and a classroom caption that lands five
+# seconds late is not realtime. Two spellings exist; only this one takes effect
+# (`enable_thinking` at the top level and `reasoning_effort` were both ignored).
+# Summary generation deliberately does NOT use this: it is offline, and the
+# reasoning budget is worth paying for there.
+NO_THINKING: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
 def _default_translation_post(
     api_key: str, base_url: str, timeout_seconds: float
 ) -> HttpPost:
@@ -425,6 +476,7 @@ class MimoTranslationProvider:
                 },
             ],
             "stream": False,
+            **NO_THINKING,
         }
         url = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json", "api-key": self.api_key}

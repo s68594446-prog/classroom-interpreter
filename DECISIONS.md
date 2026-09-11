@@ -198,6 +198,28 @@ acceptance or independent verification.
   finalization was an incidental errno rather than the domain refusal. The
   guard now raises `PurgeRefused`, and the regression test asserts that type
   rather than accepting either exception.
+- **D-041 (Live-provider integration)**: Realtime translation disables
+  provider-side reasoning via `chat_template_kwargs.enable_thinking=false`.
+  `mimo-v2.5` is a reasoning model and by default spends most of its budget in
+  `reasoning_content`. Measured against the live API on 2026-09-11 over five
+  lecture sentences: p50 latency 5.40s -> 2.29s (max 8.31s -> 2.54s) and
+  completion tokens ~152 -> ~14, with no quality loss on any sample. Sentence
+  translation does not need deliberation, and a caption five seconds late is
+  not realtime. Only this spelling works -- top-level `enable_thinking` and
+  `reasoning_effort=low` were both ignored by the provider. Summary generation
+  deliberately keeps reasoning: it is offline, quality-sensitive, and nobody is
+  waiting on it live.
+- **D-042 (Live-provider integration)**: ASR transcripts are stripped of chat
+  template scaffolding before they leave the provider adapter. The real
+  `mimo-v2.5-asr` endpoint wraps the transcript inconsistently -- the same
+  request shape returned `<chinese> Good morning, everyone.`,
+  `think>\n<chinese> Today we will...` (an unbalanced `</think>` remnant), and
+  unwrapped text, across calls. The wrapper cannot be disabled: both
+  thinking-off spellings still produce it for the ASR model. Because the English
+  transcript is the factual source for the summary, these tokens are removed in
+  `parse_asr_response` rather than downstream. Stripping is prefix-anchored and
+  never touches the interior of a transcript, so a lecturer who says "think" or
+  dictates an XML tag keeps every word.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 
