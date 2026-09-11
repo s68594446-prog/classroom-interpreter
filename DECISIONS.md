@@ -220,6 +220,24 @@ acceptance or independent verification.
   `parse_asr_response` rather than downstream. Stripping is prefix-anchored and
   never touches the interior of a transcript, so a lecturer who says "think" or
   dictates an XML tag keeps every word.
+- **D-043 (Latency)**: First-caption latency is dominated by the segment wait,
+  not the provider. Measured live 2026-09-11: ASR ~3.6s + translation ~2.3s =
+  ~6s of API time against a 12s segment wait, so the wait was two thirds of the
+  ~18s delay. `segment_preferred_seconds` drops 12 -> 6; `max` stays 30 so a
+  lecturer who never pauses still produces bounded output. **Streaming was
+  measured and rejected**: MiMo's SSE stream delivered its *first* token at p50
+  3.09s, later than a complete non-streamed reply at 2.29s, so it adds
+  complexity and latency at once. The English transcript is published as soon
+  as ASR returns rather than waiting for Chinese, so perceived latency is the
+  ASR leg alone.
+- **D-044 (Auto-pause)**: Recording auto-pauses after
+  `auto_pause_silence_seconds` (default 30, 0 disables) of continuous silence.
+  The threshold is measured against the segmenter's durable `silence_run` --
+  silence in *captured audio* -- not a wall clock, so a stalled pipeline cannot
+  fake it and a restart resumes the count. It is ignored while an utterance is
+  open, because a pause inside a sentence is speech rhythm, not an idle room.
+  Settings reject a threshold at or below `segment_silence_milliseconds`, which
+  would pause the class on every ordinary sentence gap.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 

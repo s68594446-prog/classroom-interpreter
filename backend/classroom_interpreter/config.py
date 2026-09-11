@@ -38,11 +38,23 @@ class Settings(BaseSettings):
 
     debug_classroom_content: bool = False
 
+    # First-caption latency is dominated by how long we wait for a segment to
+    # close, not by the provider. Measured live on 2026-09-11: ASR ~3.6s +
+    # translation ~2.3s = ~6s of API time, against a 12s segment wait -- the
+    # wait was two thirds of the delay. Preferred is 6s so a natural pause
+    # closes a segment sooner; max stays 30s so a lecturer who never pauses
+    # still gets bounded output. Streaming was measured and rejected: MiMo's
+    # stream produced a *later* first token (p50 3.09s) than a whole
+    # non-streamed reply (2.29s), so it buys nothing here (D-043).
     segment_min_seconds: float = Field(default=2, gt=0)
-    segment_preferred_seconds: float = Field(default=12, gt=0)
+    segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)
     segment_silence_milliseconds: int = Field(default=700, gt=0)
     segment_overlap_milliseconds: int = Field(default=250, ge=0)
+    # Auto-pause after a long quiet stretch (break, class ended, mic forgotten).
+    # 0 disables it. Must exceed the segment close threshold so an ordinary
+    # between-sentence pause can never trip it.
+    auto_pause_silence_seconds: float = Field(default=30, ge=0)
     vad_threshold_rms: float = Field(default=300, gt=0)
     context_max_segments: int = Field(default=8, gt=0)
     context_max_seconds: int = Field(default=90, gt=0)
@@ -112,6 +124,14 @@ class Settings(BaseSettings):
             raise ValueError("segment durations must satisfy min <= preferred <= max")
         if self.segment_overlap_milliseconds >= self.segment_max_seconds * 1000:
             raise ValueError("segment overlap must be shorter than maximum segment duration")
+        if (
+            self.auto_pause_silence_seconds
+            and self.auto_pause_silence_seconds * 1000
+            <= self.segment_silence_milliseconds
+        ):
+            raise ValueError(
+                "auto-pause silence must be longer than the segment silence threshold"
+            )
         return self
 
     @property

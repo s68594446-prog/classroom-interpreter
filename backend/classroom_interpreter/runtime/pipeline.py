@@ -78,6 +78,9 @@ class SessionOrchestrator:
         self._stop = asyncio.Event()
         self._finalize_task: asyncio.Task | None = None
         self.last_finalization_error: str | None = None
+        # Set when the segmenter's silence run triggered an automatic pause, so
+        # the UI can distinguish it from a pause the user pressed.
+        self.auto_paused_at_silence_seconds: float | None = None
         self.worker_faults: dict[str, dict[str, int | str]] = {}
         self.health_store = HealthMetricsStore(
             settings.health_database_path,
@@ -128,6 +131,7 @@ class SessionOrchestrator:
             raise
         self.active_session = session_id
         self.last_finalization_error = None
+        self.auto_paused_at_silence_seconds = None
         self._stop.clear()
         self._spawn_workers()
         self.publisher.publish(
@@ -215,6 +219,7 @@ class SessionOrchestrator:
         while not self._stop.is_set():
             try:
                 self._segmenter.process_available_chunks()
+                await self._maybe_auto_pause()
             except CorruptCaptureChunk as exc:
                 self.last_finalization_error = "CORRUPT_CAPTURE_CHUNK"
                 if self.active_session:
@@ -230,6 +235,35 @@ class SessionOrchestrator:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
+
+    async def _maybe_auto_pause(self) -> None:
+        """Pause recording after a long quiet stretch.
+
+        A class that ended, a break, or a microphone left running should not
+        keep burning disk and provider quota. This reads the segmenter's own
+        durable silence run rather than a wall clock, so it measures silence in
+        *captured audio* -- a stalled or restarted pipeline cannot fake it, and
+        a restart resumes the count instead of resetting it.
+
+        Only fires while RECORDING, and pause is idempotent, so a loop
+        iteration that runs again before the state change lands cannot pause
+        twice. Audio already captured is untouched: pause seals the open
+        utterance, it never discards.
+        """
+        threshold = self.settings.auto_pause_silence_seconds
+        if not threshold or self.active_session is None:
+            return
+        if self._segmenter.idle_silence_ms() < threshold * 1000:
+            return
+        session_id = self.active_session
+        record = self.repository.get_session(session_id)
+        if record.status is not SessionStatus.RECORDING:
+            return
+        # pause() records the state transition and publishes SESSION_STATE
+        # itself; this only adds why it happened, so the UI can say "paused
+        # automatically" rather than looking like the user did it.
+        await self.pause(session_id)
+        self.auto_paused_at_silence_seconds = threshold
 
     async def _asr_loop(self, worker=None) -> None:
         worker = worker or self._asr_worker

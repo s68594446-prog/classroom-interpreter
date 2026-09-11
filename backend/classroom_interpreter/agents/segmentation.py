@@ -436,6 +436,19 @@ class SegmentAgent:
         state.discarded_utterances += 1
         return None
 
+    def idle_silence_ms(self) -> int:
+        """Continuous trailing silence, in ms, while no utterance is open.
+
+        Returns 0 whenever an utterance is in progress: a pause *inside* a
+        sentence is normal speech rhythm, not an idle classroom. `silence_run`
+        is already checkpointed, so this survives a restart rather than
+        resetting the quiet stretch to zero.
+        """
+        if self._state.in_utterance:
+            return 0
+        return self._state.silence_run * FRAME_MS
+
+
     def seal_tail(self) -> tuple[SealedSegment, ...]:
         """Flush the open utterance (End Class / pause boundary). Voiced
         content is sealed even below the minimum duration; silent tails are
