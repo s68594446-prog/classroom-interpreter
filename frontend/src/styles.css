@@ -492,3 +492,20 @@ button {
   .glossary-empty { background: none; border: none; color: #7d8c86; }
   .glossary-remove:hover { color: #f0907a; background: #2e1d18; }
 }
+
+/* Interim transcript: provisional by construction, so it must never be
+   mistaken for the final line. Dimmer, italic, and with a soft left edge
+   that marks it as still arriving. */
+.caption-interim {
+  border-bottom: none;
+  opacity: 0.85;
+}
+.caption-interim-text {
+  font-style: italic;
+  color: #8b9a94;
+  border-left: 2px solid #c8d3ce;
+  padding-left: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  .caption-interim-text { color: #7d8c86; border-left-color: #39443f; }
+}

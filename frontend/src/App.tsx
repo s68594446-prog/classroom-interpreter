@@ -72,6 +72,7 @@ export function App() {
   const [termInput, setTermInput] = useState("");
   const [termZh, setTermZh] = useState("");
   const [glossaryOpen, setGlossaryOpen] = useState(false);
+  const [partial, setPartial] = useState<string>("");
 
   const cursorRef = useRef(-1);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
@@ -107,12 +108,21 @@ export function App() {
           cursorRef.current = event.event_sequence;
         }
         const payload = event.payload as Record<string, unknown>;
+        if (event.kind === "subtitle.partial") {
+          // Interim text for the sentence still being spoken. Not sequenced,
+          // so it never advances the replay cursor; superseded the moment the
+          // segment seals.
+          setPartial(String(payload.english_text ?? ""));
+          return;
+        }
         if (event.kind === "subtitle.current") {
+          setPartial("");
           setCurrent({
             sequence: Number(payload.sequence),
             english_text: String(payload.english_text ?? ""),
           });
         } else if (event.kind === "subtitle.committed") {
+          setPartial("");
           applyCommitted({
             sequence: Number(payload.sequence),
             english_text: String(payload.english_text ?? ""),
@@ -337,7 +347,7 @@ export function App() {
       if (distanceFromBottom > 160) return;
     }
     node.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [committed.length, current?.sequence]);
+  }, [committed.length, current?.sequence, partial]);
 
   const elapsedMs = (() => {
     if (!session?.started_at) return 0;
@@ -600,6 +610,17 @@ export function App() {
                     <span className="waiting-label">翻译中</span>
                   </p>
                   <p className="caption-en">{current.english_text}</p>
+                </div>
+              </article>
+            )}
+            {/* The sentence still being spoken. Appears ~2s behind the
+                speaker, versus ~7s waiting for the segment to seal. Marked
+                visually as provisional so nobody mistakes it for final text. */}
+            {partial && !current && (
+              <article className="caption caption-interim" aria-label="正在识别">
+                <span className="caption-seq">·</span>
+                <div className="caption-body">
+                  <p className="caption-en caption-interim-text">{partial}</p>
                 </div>
               </article>
             )}

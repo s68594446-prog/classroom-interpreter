@@ -364,6 +364,36 @@ class MimoASRProvider:
         self.timeout_seconds = timeout_seconds
         self._post = post or _default_post(api_key, self.base_url, timeout_seconds)
 
+    async def transcribe_bytes(self, wav_bytes: bytes) -> str:
+        """Transcribe raw WAV for interim display. Returns text, never raises.
+
+        Separate from `transcribe` because a partial has no segment identity:
+        no id, no sequence, no durable row, no TranscriptResult. Keeping it on
+        a different method makes it impossible to accidentally feed interim
+        text into the committed pipeline.
+        """
+        payload = build_asr_payload(
+            wav_bytes,
+            model=self.model,
+            language=self.language,
+            glossary=self._glossary(),
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._post(
+                    f"{self.base_url}/chat/completions",
+                    {"Content-Type": "application/json", "api-key": self.api_key},
+                    payload,
+                ),
+                timeout=self.timeout_seconds,
+            )
+            if response.status != 200:
+                return ""
+            text, _ = parse_asr_response(response.body)
+            return text
+        except Exception:
+            return ""
+
     async def transcribe(
         self, segment: AudioSegmentRef, *, language: str = "en"
     ) -> TranscriptResult:

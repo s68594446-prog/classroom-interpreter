@@ -260,6 +260,24 @@ acceptance or independent verification.
   endpoint over three hard clips: **3.1% → 1.7% word error** (-45%); the same
   audio transcribed "Itô's lemma" without the glossary and "Ito's lemma" with
   it. Prompt shape (comma list vs dash list) made no measurable difference.
+- **D-046 (Latency architecture)**: Interim ("partial") transcription. The
+  first caption used to wait for a segment to seal -- ~6s of speech plus the
+  ASR leg. A separate loop now transcribes the utterance **still being spoken**
+  every `partial_transcription_interval_seconds` (default 2s, 0 disables).
+  Measured on the live endpoint: transcribing the first 1.5s of a sentence
+  returned usable text in 0.80s, so English lands roughly **2.3s** behind the
+  speaker instead of ~7s. Also measured: ASR on a short clip costs 0.56-1.0s,
+  far less than the 3.6s seen earlier, which was mostly VPN detour, not model
+  time. **Partials are display-only and structurally incapable of becoming
+  facts**: they use `publish_ephemeral` (no database row, no sequence), travel
+  under a distinct `subtitle.partial` kind, are produced by a distinct provider
+  method (`transcribe_bytes`, returning a bare string rather than a
+  `TranscriptResult`), and carry `event_sequence = -1` so they can never
+  advance a client's replay cursor. `PERSIST FIRST, PROCESS SECOND` and
+  English-as-source-of-truth are therefore untouched: the sealed segment
+  remains the only thing the summary ever sees. The cost is roughly one extra
+  ASR call per interval per utterance, which is why it is a dial rather than
+  a default-on certainty.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 

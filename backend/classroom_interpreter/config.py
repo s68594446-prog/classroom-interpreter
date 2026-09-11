@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # 0 disables it. Must exceed the segment close threshold so an ordinary
     # between-sentence pause can never trip it.
     auto_pause_silence_seconds: float = Field(default=30, ge=0)
+    # Interim transcription of the sentence still being spoken. 0 disables it.
+    # This is what makes a caption appear ~2s after speech instead of ~7s, and
+    # it costs extra ASR calls -- roughly one per interval per utterance -- so
+    # it is a latency/cost dial, not a free win (D-046).
+    partial_transcription_interval_seconds: float = Field(default=2.0, ge=0)
+    partial_transcription_min_audio_ms: int = Field(default=1200, gt=0)
     vad_threshold_rms: float = Field(default=300, gt=0)
     context_max_segments: int = Field(default=8, gt=0)
     context_max_seconds: int = Field(default=90, gt=0)

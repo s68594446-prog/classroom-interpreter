@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from classroom_interpreter.domain.models import WebSocketEvent, WebSocketEventKind
+from classroom_interpreter.domain.models import (
+    EPHEMERAL_EVENT_SEQUENCE,
+    WebSocketEvent,
+    WebSocketEventKind,
+)
 from classroom_interpreter.storage import Database
 
 
@@ -50,6 +54,32 @@ class EventPublisher:
                 # A dead subscriber never blocks the pipeline.
                 self._subscribers.discard(queue)
         return sequence
+
+    def publish_ephemeral(
+        self, session_id: str, kind: WebSocketEventKind | str, payload: dict
+    ) -> None:
+        """Fan out to live subscribers without persisting or sequencing.
+
+        For interim transcripts (D-046), which are display-only and superseded
+        within seconds. Persisting them would be wrong twice over: they would
+        enter `websocket_events` as if they were facts, and -- because that
+        table is the replay log -- a reconnecting client would be handed a
+        burst of stale partials describing sentences that finished long ago.
+
+        `event_sequence` is -1 so it can never advance a client's replay
+        cursor; a client that reconnects resumes from the last real event.
+        """
+        event = WebSocketEvent(
+            event_sequence=EPHEMERAL_EVENT_SEQUENCE,
+            kind=WebSocketEventKind(str(kind)),
+            session_id=session_id,
+            payload=payload,
+        )
+        for queue in list(self._subscribers):
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                self._subscribers.discard(queue)
 
     def subscribe(self):
         queue = set()  # placeholder to satisfy type checkers

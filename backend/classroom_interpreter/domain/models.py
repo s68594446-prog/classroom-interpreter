@@ -50,6 +50,10 @@ class WebSocketEventKind(StrEnum):
     SYSTEM_PONG = "system.pong"
     SESSION_STATE = "session.state"
     SUBTITLE_CURRENT = "subtitle.current"
+    # Interim transcript of the sentence still being spoken. Display-only:
+    # never persisted, never sequenced, replaced by SUBTITLE_CURRENT when the
+    # segment seals (D-046).
+    SUBTITLE_PARTIAL = "subtitle.partial"
     SUBTITLE_COMMITTED = "subtitle.committed"
     HEALTH = "health.snapshot"
 
@@ -226,9 +230,19 @@ class HealthSnapshot(FrozenModel):
     checked_at: datetime = Field(default_factory=utc_now)
 
 
+# Sentinel sequence for ephemeral events (interim transcripts, D-046). Clients
+# advance their replay cursor only on sequences greater than the one they hold,
+# so a negative value can never move it -- which is the point: a partial must
+# not make a reconnect skip past a real event it has not seen.
+EPHEMERAL_EVENT_SEQUENCE = -1
+
+
 class WebSocketEvent(FrozenModel):
     schema_version: str = "1"
-    event_sequence: int = Field(ge=0)
+    # >= -1 rather than >= 0 solely to admit EPHEMERAL_EVENT_SEQUENCE. Every
+    # persisted event still carries a real, non-negative sequence; only
+    # non-persisted fan-out uses the sentinel.
+    event_sequence: int = Field(ge=EPHEMERAL_EVENT_SEQUENCE)
     kind: WebSocketEventKind
     session_id: str | None = None
     occurred_at: datetime = Field(default_factory=utc_now)

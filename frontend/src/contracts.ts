@@ -20,6 +20,10 @@ export type WebSocketEventKind =
   | "system.pong"
   | "session.state"
   | "subtitle.current"
+  // Interim transcript of the sentence still being spoken. Ephemeral: carries
+  // event_sequence -1 and is never persisted, so it must not advance the
+  // replay cursor.
+  | "subtitle.partial"
   | "subtitle.committed"
   | "health.snapshot";
 

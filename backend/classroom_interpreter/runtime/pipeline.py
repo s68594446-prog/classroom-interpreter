@@ -209,6 +209,10 @@ class SessionOrchestrator:
             ],
             asyncio.create_task(self._sequencer_loop(), name="translation-sequencer-loop"),
         ]
+        if self.settings.partial_transcription_interval_seconds:
+            self._tasks.append(
+                asyncio.create_task(self._partial_loop(), name="partial-transcription-loop")
+            )
 
     def _event_sink(self, kind: str, payload: dict) -> None:
         if self.active_session is None:
@@ -234,6 +238,59 @@ class SessionOrchestrator:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+
+    async def _partial_loop(self) -> None:
+        """Transcribe the sentence still being spoken, for display only.
+
+        Without this the first caption waits for the segment to seal: ~6s of
+        speech plus ~1s of ASR. Transcribing the open utterance every couple of
+        seconds puts English on screen roughly 2s behind the speaker, and the
+        sealed segment still replaces it when it arrives.
+
+        Everything here is deliberately outside the durable pipeline. Partial
+        text is never written to the database, never sequenced, never
+        translated, and never reaches the summary -- so `PERSIST FIRST,
+        PROCESS SECOND` and English-as-source-of-truth are untouched. A partial
+        that is wrong, late, or lost costs a moment of display, nothing more,
+        which is why every failure below is swallowed rather than recorded as a
+        pipeline fault.
+        """
+        interval = self.settings.partial_transcription_interval_seconds
+        min_ms = self.settings.partial_transcription_min_audio_ms
+        last_text = ""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            session_id = self.active_session
+            if session_id is None or self.asr_provider is None:
+                last_text = ""
+                continue
+            try:
+                if self.repository.get_session(session_id).status is not SessionStatus.RECORDING:
+                    last_text = ""
+                    continue
+                wav = self._segmenter.pending_utterance_wav(min_ms=min_ms)
+                if not wav:
+                    last_text = ""
+                    continue
+                text = await self.asr_provider.transcribe_bytes(wav)
+                if not text or text == last_text:
+                    continue
+                last_text = text
+                # Ephemeral on purpose: not persisted, not sequenced, so a
+                # reconnect never replays stale interim text.
+                self.publisher.publish_ephemeral(
+                    session_id,
+                    WebSocketEventKind.SUBTITLE_PARTIAL,
+                    {"english_text": text},
+                )
+            except Exception:
+                # Interim display only; a failed partial must never disturb the
+                # durable pipeline or surface as a session error.
                 continue
 
     async def _maybe_auto_pause(self) -> None:
