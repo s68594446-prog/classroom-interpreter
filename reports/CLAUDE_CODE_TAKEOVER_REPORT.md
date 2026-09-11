@@ -832,8 +832,12 @@ many-small-files shape that sync handles worst. Moving the checkout out of
 
 Unchanged by this session; nothing below is claimed:
 
-- **Real MiMo ASR / translation / summary** — permissions, quota, cost, quality,
-  latency, timeout, rate limiting. No API key was requested or used.
+- ~~**Real MiMo ASR / translation / summary**~~ — **partially closed 2026-09-11.**
+  All three providers were exercised against the live API; two real defects were
+  found and fixed (D-041, D-042). See
+  `reports/LIVE_MIMO_VERIFICATION_2026-09-11.md`. Still open within this item:
+  rate limiting (no real 429 ever seen), cost, sustained load, and any
+  independent judgement of model quality.
 - **Real three-hour wall-clock microphone capture.** The 9000 s figure is
   synthetic audio duration; actual runtime was 189.81 s. The only real-mic
   evidence remains the historical 30-minute Phase 2 capture.
