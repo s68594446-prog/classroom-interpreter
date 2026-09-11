@@ -189,3 +189,42 @@ def recovery_delete(session_id: str, request: Request) -> dict:
         raise HTTPException(status_code=409, detail=f"PURGE_REFUSED:{exc}") from exc
     except KeyError:
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND") from None
+
+
+class GlossaryTermRequest(BaseModel):
+    """A term the user typed. Never derived from a recording."""
+
+    term: str = Field(min_length=1, max_length=120)
+    preferred_chinese: str | None = Field(default=None, max_length=120)
+
+
+@router.get("/glossary/{course_name}")
+def glossary_list(course_name: str, request: Request) -> dict:
+    """Terms for a course.
+
+    Keyed by course rather than session so a weekly course keeps its vocabulary
+    without re-entry.
+    """
+    runtime = _get_runtime(request)
+    return {"terms": runtime.repository.list_glossary_terms(course_name)}
+
+
+@router.post("/glossary/{course_name}")
+def glossary_add(
+    course_name: str, payload: GlossaryTermRequest, request: Request
+) -> dict:
+    runtime = _get_runtime(request)
+    try:
+        return runtime.repository.add_glossary_term(
+            course_name, payload.term, payload.preferred_chinese
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.delete("/glossary/term/{term_id}")
+def glossary_delete(term_id: str, request: Request) -> dict:
+    runtime = _get_runtime(request)
+    if not runtime.repository.delete_glossary_term(term_id):
+        raise HTTPException(status_code=404, detail="TERM_NOT_FOUND")
+    return {"deleted": term_id}

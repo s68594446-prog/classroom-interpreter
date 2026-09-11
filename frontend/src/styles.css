@@ -374,3 +374,121 @@ button {
     border-left-color: #d9a520; color: #e8d9a8;
   }
 }
+
+/* ============================================================
+   Glossary — collapsed by default.
+
+   It earns its place only when a term is wrong, so it must not
+   compete with captions for vertical space during a lecture.
+   ============================================================ */
+
+.glossary-card {
+  margin-top: 16px;
+  background: #ffffff;
+  border: 1px solid #dfe6e2;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.glossary-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: #16211c;
+  text-align: left;
+}
+.glossary-toggle:hover { background: #f4f7f5; }
+
+.glossary-count {
+  font-size: 12px;
+  font-weight: 400;
+  color: #6b7a74;
+}
+
+.glossary-body {
+  padding: 0 16px 16px;
+  border-top: 1px solid #eef2f0;
+}
+
+.glossary-help {
+  margin: 12px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #6b7a74;
+}
+
+.glossary-input-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.glossary-input-row input {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #dfe6e2;
+  border-radius: 8px;
+}
+.glossary-input-row button { flex: 0 0 auto; }
+
+.glossary-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.glossary-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 5px 11px;
+  background: #f4f7f5;
+  border: 1px solid #dfe6e2;
+  border-radius: 999px;
+  font-size: 13px;
+  max-width: 100%;
+}
+.glossary-term { color: #16211c; word-break: break-word; }
+.glossary-zh { color: #6b7a74; }
+.glossary-empty {
+  background: none;
+  border: none;
+  color: #9aa8a2;
+  padding-left: 0;
+}
+
+.glossary-remove {
+  border: none;
+  background: transparent;
+  color: #9aa8a2;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.glossary-remove:hover { color: #c2553a; background: #ffe8e2; }
+
+@media (prefers-color-scheme: dark) {
+  .glossary-card { background: #1a201d; border-color: #2b3531; }
+  .glossary-toggle { color: #eef3f1; }
+  .glossary-toggle:hover { background: #212926; }
+  .glossary-count, .glossary-help, .glossary-zh { color: #8b9a94; }
+  .glossary-body { border-top-color: #232b28; }
+  .glossary-input-row input {
+    background: #121614; border-color: #2b3531; color: #e6ece9;
+  }
+  .glossary-list li { background: #121614; border-color: #2b3531; }
+  .glossary-term { color: #eef3f1; }
+  .glossary-empty { background: none; border: none; color: #7d8c86; }
+  .glossary-remove:hover { color: #f0907a; background: #2e1d18; }
+}

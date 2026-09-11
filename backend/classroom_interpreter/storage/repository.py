@@ -1284,6 +1284,68 @@ class SessionRepository:
             )
             return cursor.rowcount
 
+    # ---- Glossary (user configuration, not classroom content) ----------
+
+    def list_glossary_terms(self, course_name: str) -> list[dict]:
+        """Terms for a course, longest first.
+
+        Longest-first matters at the point of use: when the glossary is
+        rendered into a prompt the specific multi-word entries ("geometric
+        Brownian motion") should be seen before their fragments ("motion"),
+        so the model anchors on the full term.
+        """
+        with self.database.connect() as connection:
+            return [
+                {
+                    "id": row["id"],
+                    "term": row["term"],
+                    "preferred_chinese": row["preferred_chinese"],
+                }
+                for row in connection.execute(
+                    "SELECT id, term, preferred_chinese FROM glossary_terms"
+                    " WHERE course_name = ? ORDER BY length(term) DESC, term ASC",
+                    (course_name,),
+                ).fetchall()
+            ]
+
+    def add_glossary_term(
+        self, course_name: str, term: str, preferred_chinese: str | None = None
+    ) -> dict:
+        """Add or update one term. Idempotent on (course_name, term)."""
+        cleaned = term.strip()
+        if not cleaned:
+            raise ValueError("glossary term must not be blank")
+        chinese = (preferred_chinese or "").strip() or None
+        now = _now_iso()
+        term_id = str(uuid.uuid4())
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO glossary_terms(id, course_name, term, preferred_chinese, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(course_name, term)
+                DO UPDATE SET preferred_chinese = excluded.preferred_chinese
+                """,
+                (term_id, course_name, cleaned, chinese, now),
+            )
+            row = connection.execute(
+                "SELECT id, term, preferred_chinese FROM glossary_terms"
+                " WHERE course_name = ? AND term = ?",
+                (course_name, cleaned),
+            ).fetchone()
+        return {
+            "id": row["id"],
+            "term": row["term"],
+            "preferred_chinese": row["preferred_chinese"],
+        }
+
+    def delete_glossary_term(self, term_id: str) -> bool:
+        with self.database.transaction() as connection:
+            cur = connection.execute(
+                "DELETE FROM glossary_terms WHERE id = ?", (term_id,)
+            )
+            return cur.rowcount > 0
+
     def commit_translation_result_direct(
         self, session_id: str, sequence: int, result: TranslationResult
     ) -> CommitOutcome:

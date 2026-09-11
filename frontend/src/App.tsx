@@ -48,6 +48,12 @@ function statusLabel(status: SessionStatus): string {
   }
 }
 
+interface GlossaryTerm {
+  id: string;
+  term: string;
+  preferred_chinese: string | null;
+}
+
 export function App() {
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
@@ -62,6 +68,10 @@ export function App() {
   const [now, setNow] = useState(Date.now());
   const [endBusy, setEndBusy] = useState(false);
   const [autoPausedAfter, setAutoPausedAfter] = useState<number | null>(null);
+  const [terms, setTerms] = useState<GlossaryTerm[]>([]);
+  const [termInput, setTermInput] = useState("");
+  const [termZh, setTermZh] = useState("");
+  const [glossaryOpen, setGlossaryOpen] = useState(false);
 
   const cursorRef = useRef(-1);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
@@ -243,6 +253,37 @@ export function App() {
     } finally {
       setEndBusy(false);
     }
+  };
+
+  const loadGlossary = useCallback(async (course: string) => {
+    if (!course.trim()) return;
+    const r = await fetch(`/api/glossary/${encodeURIComponent(course)}`);
+    if (r.ok) setTerms(((await r.json()).terms ?? []) as GlossaryTerm[]);
+  }, []);
+
+  const addTerm = async (course: string) => {
+    const term = termInput.trim();
+    if (!term) return;
+    const r = await fetch(`/api/glossary/${encodeURIComponent(course)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        term,
+        preferred_chinese: termZh.trim() || null,
+      }),
+    });
+    if (r.ok) {
+      setTermInput("");
+      setTermZh("");
+      await loadGlossary(course);
+    } else {
+      setError("术语添加失败");
+    }
+  };
+
+  const removeTerm = async (id: string, course: string) => {
+    const r = await fetch(`/api/glossary/term/${id}`, { method: "DELETE" });
+    if (r.ok) await loadGlossary(course);
   };
 
   const resumeRecovery = async (sessionId: string) => {
@@ -457,6 +498,72 @@ export function App() {
               <p className="progress-line">
                 正在等待全部语音与翻译完成，随后生成课程总结…
               </p>
+            )}
+          </section>
+
+          <section className="glossary-card">
+            <button
+              type="button"
+              className="glossary-toggle"
+              onClick={() => {
+                const next = !glossaryOpen;
+                setGlossaryOpen(next);
+                if (next) loadGlossary(session.course_name);
+              }}
+              aria-expanded={glossaryOpen}
+            >
+              <span>术语库</span>
+              <span className="glossary-count">
+                {terms.length > 0 ? `${terms.length} 个` : "提高专业词准确率"}
+              </span>
+            </button>
+            {glossaryOpen && (
+              <div className="glossary-body">
+                <p className="glossary-help">
+                  加入本课的专业术语，识别与翻译会优先使用它们；填了中文就会固定用该译法，
+                  避免同一个词每段翻得不一样。
+                </p>
+                <div className="glossary-input-row">
+                  <input
+                    value={termInput}
+                    onChange={(e) => setTermInput(e.target.value)}
+                    placeholder="英文术语，如 Ito's lemma"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addTerm(session.course_name);
+                    }}
+                  />
+                  <input
+                    value={termZh}
+                    onChange={(e) => setTermZh(e.target.value)}
+                    placeholder="指定中文（可留空）"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addTerm(session.course_name);
+                    }}
+                  />
+                  <button type="button" onClick={() => addTerm(session.course_name)}>
+                    添加
+                  </button>
+                </div>
+                <ul className="glossary-list">
+                  {terms.length === 0 && <li className="glossary-empty">还没有术语</li>}
+                  {terms.map((t) => (
+                    <li key={t.id}>
+                      <span className="glossary-term">{t.term}</span>
+                      {t.preferred_chinese && (
+                        <span className="glossary-zh">→ {t.preferred_chinese}</span>
+                      )}
+                      <button
+                        type="button"
+                        className="glossary-remove"
+                        aria-label={`删除 ${t.term}`}
+                        onClick={() => removeTerm(t.id, session.course_name)}
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </section>
 

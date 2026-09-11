@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import expected_schema_version
 from classroom_interpreter.storage import Database, IdempotencyConflict, SessionRepository
 
 
@@ -29,7 +30,7 @@ EXPECTED_TABLES = {
 def test_migration_is_idempotent_and_creates_expected_schema(
     database: Database,
 ) -> None:
-    assert database.migrate() == 5
+    assert database.migrate() == expected_schema_version()
     with database.connect() as connection:
         tables = {
             row["name"]
@@ -58,14 +59,16 @@ def test_migration_three_upgrades_both_experimental_v2_variants(
     (v2_dir / "002_capture.sql").write_text(script)
     path = tmp_path / "upgrade.sqlite3"
     assert Database(path, migrations_dir=v2_dir).migrate() == 2
-    assert Database(path, migrations_dir=source).migrate() == 5
+    assert Database(path, migrations_dir=source).migrate() == expected_schema_version()
     with Database(path).connect() as connection:
         columns = [row["name"] for row in connection.execute(
             "PRAGMA table_info(capture_chunks)")]
         versions = [row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version")]
     assert columns.count("monotonic_clock_id") == 1
-    assert versions == [1, 2, 3, 4, 5]
+    # Derived, not literal: this asserts every migration on disk was applied
+    # exactly once and in order, which stays true as migrations are added.
+    assert versions == list(range(1, expected_schema_version() + 1))
 
 
 def test_post_purge_metadata_table_has_exact_allowlist(database: Database) -> None:

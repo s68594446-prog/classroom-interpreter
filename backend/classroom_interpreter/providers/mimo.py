@@ -5,7 +5,7 @@ import base64
 import binascii
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,8 +44,57 @@ class ProviderHttpResponse:
 HttpPost = Callable[[str, Mapping[str, str], Mapping[str, Any]], Awaitable[ProviderHttpResponse]]
 
 
+# A glossary is capped before it reaches a prompt. An unbounded list would grow
+# the request on every segment, and past a point extra terms stop helping and
+# start crowding the instruction that matters.
+MAX_GLOSSARY_TERMS = 60
+
+
+def render_glossary_hint(terms: Sequence[Mapping[str, Any]], *, for_translation: bool) -> str:
+    """Render glossary terms into a prompt fragment, or "" when there are none.
+
+    Two different jobs from one list. For ASR the terms are spelling anchors:
+    measured on synthesized lecture audio, residual transcription error was
+    almost entirely domain-term spelling rather than misheard speech. For
+    translation they pin terminology so the same English term does not drift
+    between synonyms from one segment to the next -- a lecture that renders
+    "strike price" three different ways is harder to revise from than one
+    consistent choice.
+    """
+    if not terms:
+        return ""
+    capped = list(terms)[:MAX_GLOSSARY_TERMS]
+    if for_translation:
+        lines = []
+        for entry in capped:
+            term = str(entry.get("term", "")).strip()
+            if not term:
+                continue
+            chinese = (entry.get("preferred_chinese") or "").strip()
+            lines.append(f"- {term} → {chinese}" if chinese else f"- {term}")
+        if not lines:
+            return ""
+        return (
+            "\n\nThis course uses the following terminology. Where a term below has a "
+            "Chinese rendering, use exactly that rendering; keep the others "
+            "consistent throughout:\n" + "\n".join(lines)
+        )
+    names = [str(e.get("term", "")).strip() for e in capped]
+    names = [n for n in names if n]
+    if not names:
+        return ""
+    return (
+        "\n\nThe speaker may have a non-native accent. This lecture uses these exact "
+        "terms; prefer them when a word is ambiguous:\n- " + "\n- ".join(names)
+    )
+
+
 def build_asr_payload(
-    wav_bytes: bytes, *, model: str, language: str
+    wav_bytes: bytes,
+    *,
+    model: str,
+    language: str,
+    glossary: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Build the documented chat/completions ASR request body.
 
@@ -71,22 +120,23 @@ def build_asr_payload(
                 safe_message="encoded audio payload exceeds provider limit",
             )
         )
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_audio",
+            "input_audio": {
+                "data": f"data:audio/wav;base64,{encoded}",
+                "format": "wav",
+            },
+        }
+    ]
+    hint = render_glossary_hint(glossary, for_translation=False)
+    if hint:
+        # Appended after the audio so the audio stays the first content item,
+        # which is the shape the documented ASR request uses.
+        content.append({"type": "text", "text": hint.strip()})
     return {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": f"data:audio/wav;base64,{encoded}",
-                            "format": "wav",
-                        },
-                    }
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": content}],
         "asr_options": {"language": language},
         "stream": False,
     }
@@ -289,6 +339,7 @@ class MimoASRProvider:
         language: str = "en",
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         post: HttpPost | None = None,
+        glossary_provider: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError(
@@ -452,6 +503,7 @@ class MimoTranslationProvider:
         model: str,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         post: HttpPost | None = None,
+        glossary_provider: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
     ) -> None:
         if not api_key:
             raise ValueError(
@@ -463,13 +515,21 @@ class MimoTranslationProvider:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self._post = post or _default_post(api_key, self.base_url, timeout_seconds)
+        self._glossary = glossary_provider or (lambda: ())
 
     async def translate(self, request: TranslationRequest) -> TranslationResult:
         started = utc_now()
+        # Appended to the system prompt, not the user content: the user turn
+        # carries the segment being translated and its context, and mixing
+        # course configuration into it would make the context snapshot hash
+        # (D-035) depend on glossary edits made long after the fact.
+        system_prompt = TRANSLATION_SYSTEM_PROMPT + render_glossary_hint(
+            self._glossary(), for_translation=True
+        )
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": render_translation_user_content(request),

@@ -238,6 +238,21 @@ acceptance or independent verification.
   open, because a pause inside a sentence is speech rhythm, not an idle room.
   Settings reject a threshold at or below `segment_silence_milliseconds`, which
   would pause the class on every ordinary sentence gap.
+- **D-045 (Accuracy)**: A per-course glossary is injected into both the ASR and
+  the translation prompt. Measured on synthesized lecture audio, residual
+  transcription error was almost entirely domain-term spelling
+  ("heteroscedasticity" for "heteroskedasticity") rather than misheard speech,
+  and those errors land in the English transcript that the summary treats as
+  fact. For ASR the terms act as spelling anchors and carry an explicit
+  non-native-accent hint; for translation a term may pin an exact Chinese
+  rendering so terminology does not drift between synonyms across segments.
+  Terms are keyed by `course_name`, so a weekly course keeps its vocabulary.
+  A glossary is **user configuration, not classroom content** -- it holds only
+  what the user typed -- so it is absent from `CONTENT_TABLES` and deliberately
+  survives purge. The list is capped at 60 entries: past that, extra terms stop
+  helping and start crowding the instruction. Providers take a
+  `glossary_provider` callable rather than a new protocol argument, so the
+  `ASRProvider` / `TranslationProvider` protocols and every mock stay unchanged.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 

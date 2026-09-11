@@ -19,12 +19,18 @@ from classroom_interpreter.providers.mimo import (
 )
 from classroom_interpreter.runtime.pipeline import SessionOrchestrator, bind_database
 from classroom_interpreter.storage import Database
+from classroom_interpreter.storage.repository import SessionRepository
 
 
-def _build_providers(settings: Settings):
+def _build_providers(settings: Settings, glossary_provider=None):
     """Real MiMo adapters only when a key is configured. No silent mock: a
     missing key leaves providers unset and Start Class is refused with an
-    actionable readiness error."""
+    actionable readiness error.
+
+    `glossary_provider` is a zero-arg callable returning the active course's
+    terms. It is resolved per request rather than baked in, so starting a
+    different course -- or editing the glossary mid-lecture -- takes effect on
+    the next segment without rebuilding providers."""
     if not settings.mimo_api_key:
         return None, None, None
     return (
@@ -33,11 +39,13 @@ def _build_providers(settings: Settings):
             base_url=settings.mimo_base_url,
             model=settings.mimo_asr_model,
             language=settings.mimo_asr_language,
+            glossary_provider=glossary_provider,
         ),
         MimoTranslationProvider(
             api_key=settings.mimo_api_key,
             base_url=settings.mimo_base_url,
             model=settings.mimo_translation_model,
+            glossary_provider=glossary_provider,
         ),
         MimoSummaryProvider(
             api_key=settings.mimo_api_key,
@@ -62,8 +70,24 @@ def create_app(
         app.state.settings = resolved_settings
         app.state.database = resolved_database
         if runtime is None:
+            # Providers need the active course's glossary, but the orchestrator
+            # that knows the active session is built *after* them. Resolving
+            # through app.state at call time breaks that cycle without handing
+            # the providers a database handle they would otherwise keep.
+            def glossary_for_active_course():
+                active_runtime = getattr(app.state, "runtime", None)
+                session_id = getattr(active_runtime, "active_session", None)
+                if not session_id:
+                    return ()
+                repository = SessionRepository(resolved_database)
+                try:
+                    course = repository.get_session(session_id).course_name
+                except KeyError:
+                    return ()
+                return repository.list_glossary_terms(course)
+
             asr_provider, translation_provider, summary_provider = _build_providers(
-                resolved_settings
+                resolved_settings, glossary_for_active_course
             )
             app.state.runtime = SessionOrchestrator(
                 resolved_settings,
