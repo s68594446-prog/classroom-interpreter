@@ -152,3 +152,26 @@ def test_segmenter_reports_no_idle_silence_while_speech_is_open(tmp_path):
             in_utterance=False, silence_run=10_000 // FRAME_MS
         )
         assert segmenter.idle_silence_ms() == 10_000
+
+
+def test_state_payload_distinguishes_auto_pause_from_a_user_pause(tmp_path):
+    """The UI must be able to explain why recording stopped.
+
+    Without this the user sees PAUSED with no reason and reasonably assumes
+    something broke. A pause the user pressed must NOT be labelled automatic.
+
+    Mutation that turns this red: report the reason regardless of who paused,
+    or forget to clear it in `pause()`.
+    """
+    with recording_session(tmp_path, idle_ms=31_000) as (client, _db, runtime, sid):
+        asyncio.run(runtime._maybe_auto_pause())
+        auto = runtime._state_payload(sid)
+        assert auto["status"] == "PAUSED"
+        assert auto["auto_paused_after_seconds"] == 30.0
+
+    # A pause the user pressed carries no automatic reason.
+    with recording_session(tmp_path, idle_ms=0) as (client, _db, runtime, sid):
+        asyncio.run(runtime.pause(sid))
+        manual = runtime._state_payload(sid)
+        assert manual["status"] == "PAUSED"
+        assert manual["auto_paused_after_seconds"] is None

@@ -191,3 +191,186 @@ button {
   gap: 12px;
   padding: 8px 0;
 }
+
+/* ============================================================
+   Caption stream — the part a student actually reads in class.
+
+   Design constraints specific to this use:
+   - Chinese is the payload, English is the check. Chinese leads and is
+     larger; English sits beneath at reduced contrast.
+   - Read peripherally while listening, so line length is capped near 34
+     Chinese characters and line-height is generous.
+   - The stream scrolls; the page does not. The controls stay reachable
+     without scrolling back up mid-lecture.
+   ============================================================ */
+
+.caption-stream {
+  margin-top: 20px;
+  padding: 18px 20px;
+  background: #ffffff;
+  border: 1px solid #dfe6e2;
+  border-radius: 14px;
+  /* Tall enough for ~4 captions; the viewport, not the page, does the
+     scrolling so Pause/Resume never scroll out of reach. */
+  height: min(56vh, 520px);
+  overflow-y: auto;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+
+.stream-empty {
+  color: #6b7a74;
+  text-align: center;
+  padding: 40px 0;
+  margin: 0;
+}
+
+.caption {
+  display: flex;
+  gap: 14px;
+  padding: 14px 0;
+  border-bottom: 1px solid #eef2f0;
+}
+.caption:last-of-type {
+  border-bottom: none;
+}
+
+.caption-seq {
+  flex: 0 0 auto;
+  min-width: 26px;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: #9aa8a2;
+  padding-top: 6px;
+}
+
+.caption-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.caption-zh {
+  margin: 0 0 6px;
+  font-size: 21px;
+  line-height: 1.65;
+  color: #16211c;
+  max-width: 34em;
+  /* Chinese has no inter-word spaces; let it break anywhere rather than
+     pushing a long clause into a horizontal overflow. */
+  word-break: break-word;
+}
+
+.caption-en {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #6b7a74;
+  max-width: 46em;
+}
+
+/* A caption whose Chinese has not arrived yet. It occupies its final
+   position immediately so the line does not jump when the translation
+   lands ~2.3s later. */
+.caption-pending .caption-zh {
+  color: #9aa8a2;
+}
+
+.caption-waiting {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+}
+
+.caption-waiting .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #b6c3bd;
+  animation: caption-pulse 1.4s ease-in-out infinite;
+}
+.caption-waiting .dot:nth-child(2) { animation-delay: 0.18s; }
+.caption-waiting .dot:nth-child(3) { animation-delay: 0.36s; }
+
+.waiting-label {
+  font-size: 13px;
+  color: #9aa8a2;
+  margin-left: 4px;
+}
+
+@keyframes caption-pulse {
+  0%, 100% { opacity: 0.3; transform: translateY(0); }
+  50%      { opacity: 1;   transform: translateY(-2px); }
+}
+
+/* Respect users who have asked the OS for less motion; the dots still
+   read as "waiting" without moving. */
+@media (prefers-reduced-motion: reduce) {
+  .caption-waiting .dot { animation: none; opacity: 0.55; }
+  .caption-stream { scroll-behavior: auto; }
+}
+
+.auto-pause-banner {
+  margin: 12px 0 0;
+  padding: 11px 14px;
+  background: #fff8e6;
+  border: 1px solid #f0dfae;
+  border-left: 3px solid #d9a520;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #6b551a;
+}
+
+/* Dark rooms are the normal case for a lecture hall.
+   Every surface needs a dark counterpart, not just the new ones: theming
+   `:root` alone leaves the existing white cards with pale text on white,
+   which is what happened the first time I wrote this block. */
+@media (prefers-color-scheme: dark) {
+  :root { color: #e6ece9; background: #121614; }
+
+  /* Existing surfaces */
+  .session-card,
+  .health-card,
+  .subtitle-card,
+  .recovery-card {
+    background: #1a201d;
+    border-color: #2b3531;
+  }
+  .eyebrow, .label, .phase, .caption-seq, .waiting-label, .stream-empty,
+  .subtitle-index, .progress-line {
+    color: #8b9a94;
+  }
+  input {
+    background: #121614;
+    border-color: #2b3531;
+    color: #e6ece9;
+  }
+  input::placeholder { color: #6b7a74; }
+  button {
+    background: #232b28;
+    border-color: #39443f;
+    color: #e6ece9;
+  }
+  button:hover:not(:disabled) { background: #2c3532; }
+  button:disabled { opacity: 0.45; }
+  .health-row { border-color: #232b28; }
+  .recovery-row { border-color: #232b28; }
+  .ws-ok { color: #6fce9f; }
+  .ws-down { color: #e5896f; }
+  .error-text { color: #f0907a; }
+  .delay-warning { color: #e8c06a; }
+
+  /* Caption stream */
+  .caption-stream { background: #1a201d; border-color: #2b3531; }
+  .caption { border-bottom-color: #232b28; }
+  .caption-zh { color: #eef3f1; }
+  .caption-en { color: #93a29c; }
+  .caption-pending .caption-zh { color: #7d8c86; }
+  .caption-waiting .dot { background: #4a5a54; }
+
+  .auto-pause-banner {
+    background: #2a2312; border-color: #4d411d;
+    border-left-color: #d9a520; color: #e8d9a8;
+  }
+}

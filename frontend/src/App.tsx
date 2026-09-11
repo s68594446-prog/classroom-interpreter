@@ -61,8 +61,10 @@ export function App() {
   const [recoverable, setRecoverable] = useState<SessionRecord[]>([]);
   const [now, setNow] = useState(Date.now());
   const [endBusy, setEndBusy] = useState(false);
+  const [autoPausedAfter, setAutoPausedAfter] = useState<number | null>(null);
 
   const cursorRef = useRef(-1);
+  const streamEndRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
 
@@ -112,6 +114,8 @@ export function App() {
             c && c.sequence === Number(payload.sequence) ? null : c,
           );
         } else if (event.kind === "session.state") {
+          const reason = payload.auto_paused_after_seconds;
+          setAutoPausedAfter(typeof reason === "number" ? reason : null);
           setSession((s) =>
             s
               ? {
@@ -223,6 +227,7 @@ export function App() {
 
   const control = async (action: "pause" | "resume" | "end") => {
     if (!session) return;
+    setError(null);
     if (action === "end") setEndBusy(true);
     try {
       const response = await fetch(`/api/sessions/${session.id}/${action}`, {
@@ -241,6 +246,10 @@ export function App() {
   };
 
   const resumeRecovery = async (sessionId: string) => {
+    // Clear the previous failure first. Without this a stale banner (e.g.
+    // SINGLE_ACTIVE_SESSION from an earlier Start Class) stays on screen after
+    // this action succeeds, and reads as if *this* action failed.
+    setError(null);
     const response = await fetch(`/api/recovery/${sessionId}/resume`, {
       method: "POST",
     });
@@ -253,6 +262,7 @@ export function App() {
   };
 
   const deleteRecovery = async (sessionId: string) => {
+    setError(null);
     const response = await fetch(`/api/recovery/${sessionId}`, {
       method: "DELETE",
     });
@@ -273,6 +283,20 @@ export function App() {
       setError(body.detail ?? "删除失败");
     }
   };
+
+  // Keep the newest caption in view, but never yank the page while the user is
+  // scrolled up reading something earlier.
+  useEffect(() => {
+    const node = streamEndRef.current;
+    if (!node) return;
+    const stream = node.parentElement;
+    if (stream) {
+      const distanceFromBottom =
+        stream.scrollHeight - stream.scrollTop - stream.clientHeight;
+      if (distanceFromBottom > 160) return;
+    }
+    node.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [committed.length, current?.sequence]);
 
   const elapsedMs = (() => {
     if (!session?.started_at) return 0;
@@ -362,6 +386,12 @@ export function App() {
                 {connected ? "已连接" : "重连中…"}
               </span>
             </div>
+            {paused && autoPausedAfter !== null && (
+              <p className="auto-pause-banner" role="status">
+                已自动暂停：检测到 {Math.round(autoPausedAfter)} 秒无人说话。
+                已录制的内容都在，按 Resume 继续。
+              </p>
+            )}
             <div className="controls">
               <button
                 type="button"
@@ -430,25 +460,43 @@ export function App() {
             )}
           </section>
 
-          {current && (
-            <section className="subtitle-card" aria-label="Current">
-              <p className="label">EN · current（未提交）</p>
-              <p>{current.english_text}</p>
-            </section>
-          )}
+          <section className="caption-stream" aria-label="字幕" aria-live="polite">
+            {committed.length === 0 && !current && (
+              <p className="stream-empty">
+                等待第一句…（英文先出现，中文随后补上）
+              </p>
+            )}
 
-          <section className="subtitle-card" aria-label="Committed history">
-            <p className="label">已提交 · EN + 中文</p>
-            {committed.length === 0 && <p>暂无已提交字幕。</p>}
             {committed.map((item) => (
-              <div className="subtitle-row" key={item.sequence}>
-                <span className="subtitle-index">#{item.sequence}</span>
-                <div>
-                  <p className="en">{item.english_text}</p>
-                  <p className="zh">{item.chinese_text}</p>
+              <article className="caption" key={item.sequence}>
+                <span className="caption-seq">{item.sequence + 1}</span>
+                <div className="caption-body">
+                  {/* Chinese first and largest: it is what the reader is here
+                      for. English stays beneath as the checkable source. */}
+                  <p className="caption-zh">{item.chinese_text}</p>
+                  <p className="caption-en">{item.english_text}</p>
                 </div>
-              </div>
+              </article>
             ))}
+
+            {/* English lands ~2.3s before Chinese. Showing it immediately, in
+                the same stream, is the difference between a ~6s and a ~3.6s
+                perceived delay -- the row is already on screen and fills in. */}
+            {current && (
+              <article className="caption caption-pending" key={`p-${current.sequence}`}>
+                <span className="caption-seq">{current.sequence + 1}</span>
+                <div className="caption-body">
+                  <p className="caption-zh caption-waiting">
+                    <span className="dot" />
+                    <span className="dot" />
+                    <span className="dot" />
+                    <span className="waiting-label">翻译中</span>
+                  </p>
+                  <p className="caption-en">{current.english_text}</p>
+                </div>
+              </article>
+            )}
+            <div ref={streamEndRef} />
           </section>
         </>
       )}

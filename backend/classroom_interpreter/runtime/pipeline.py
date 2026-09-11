@@ -335,6 +335,9 @@ class SessionOrchestrator:
         record = self.repository.get_session(session_id)
         if record.status is SessionStatus.PAUSED:
             return record  # idempotent command
+        # A pause the user pressed is not an auto-pause; clear any stale reason
+        # so the UI never mislabels it.
+        self.auto_paused_at_silence_seconds = None
         if record.status is not SessionStatus.RECORDING:
             raise RuntimeError(f"PAUSE_INVALID_STATE:{record.status.value}")
         await asyncio.to_thread(self.listener.pause, session_id)
@@ -696,6 +699,14 @@ class SessionOrchestrator:
             "status": record.status.value,
             "course_name": record.course_name,
             "progress": self.progress(session_id),
+            # Lets the UI say "paused automatically after N s of silence"
+            # instead of leaving the user wondering why recording stopped.
+            # None whenever the pause was the user's own.
+            "auto_paused_after_seconds": (
+                self.auto_paused_at_silence_seconds
+                if record.status is SessionStatus.PAUSED
+                else None
+            ),
         }
 
     def _pending_counts(self, session_id: str) -> dict:

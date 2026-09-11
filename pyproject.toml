@@ -12,6 +12,12 @@ dependencies = [
   "pydantic>=2.13,<3",
   "pydantic-settings>=2.14,<3",
   "uvicorn>=0.48,<0.49",
+  # uvicorn ships no WebSocket implementation of its own. Without this the
+  # /ws endpoint returns 404 and live captions never arrive -- the backend
+  # looks healthy, the UI just sits on "重连中…". The TestClient-based tests
+  # do not catch it because Starlette's test transport speaks WebSocket
+  # in-process and never goes through uvicorn.
+  "websockets>=13,<16",
 ]
 
 [project.optional-dependencies]
