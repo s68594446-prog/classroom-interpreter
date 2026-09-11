@@ -49,3 +49,6 @@ playwright-report/
 test-results/
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Internal takeover instructions; kept locally, never versioned.
+CLAUDE_CODE_MASTER_HANDOFF.md
