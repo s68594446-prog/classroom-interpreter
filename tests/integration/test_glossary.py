@@ -74,26 +74,48 @@ def test_terms_are_ordered_longest_first(database):
 def test_asr_payload_is_unchanged_when_no_glossary_exists():
     """The common case must not pay for this feature.
 
-    Mutation that turns this red: append the hint unconditionally.
+    Mutation that turns this red: emit the system message unconditionally.
     """
     payload = build_asr_payload(b"\x00" * 64, model="m", language="en")
+    assert [m["role"] for m in payload["messages"]] == ["user"]
     content = payload["messages"][0]["content"]
     assert len(content) == 1
     assert content[0]["type"] == "input_audio"
 
 
-def test_asr_payload_carries_terms_and_an_accent_hint():
+def test_asr_glossary_travels_as_a_system_message_not_a_text_part():
+    """Pins the one channel the real ASR endpoint actually accepts.
+
+    Measured against the live API on 2026-09-12, with the same audio:
+
+      * a `text` part beside the audio (either order) -> 400 "Param Incorrect"
+      * `asr_options.hotwords` / `asr_options.prompt` -> 200 but ignored,
+        output byte-identical to the no-glossary baseline
+      * a system message -> 200 **and effective**: "Itô's lemma" without it,
+        "Ito's lemma" with it, matching the glossary entry
+
+    My first implementation used a text part, which this endpoint rejects
+    outright -- every transcription would have failed with the feature on. The
+    user content must stay audio-only.
+
+    Mutation that turns this red: move the hint into the user content.
+    """
     payload = build_asr_payload(
         b"\x00" * 64,
         model="m",
         language="en",
         glossary=[{"term": "Ito's lemma"}, {"term": "heteroskedasticity"}],
     )
-    content = payload["messages"][0]["content"]
-    assert content[0]["type"] == "input_audio", "audio must stay the first item"
-    text = content[1]["text"]
-    assert "Ito's lemma" in text and "heteroskedasticity" in text
-    assert "accent" in text.lower()
+    assert [m["role"] for m in payload["messages"]] == ["system", "user"]
+    system_text = payload["messages"][0]["content"]
+    assert isinstance(system_text, str)
+    assert "Ito's lemma" in system_text and "heteroskedasticity" in system_text
+    assert "accent" in system_text.lower()
+
+    user_content = payload["messages"][-1]["content"]
+    assert [c["type"] for c in user_content] == ["input_audio"], (
+        "a text part beside the audio is rejected with 400 by the real endpoint"
+    )
 
 
 def test_translation_hint_pins_the_chinese_rendering():

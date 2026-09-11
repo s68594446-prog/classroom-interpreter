@@ -120,23 +120,34 @@ def build_asr_payload(
                 safe_message="encoded audio payload exceeds provider limit",
             )
         )
-    content: list[dict[str, Any]] = [
-        {
-            "type": "input_audio",
-            "input_audio": {
-                "data": f"data:audio/wav;base64,{encoded}",
-                "format": "wav",
-            },
-        }
-    ]
+    messages: list[dict[str, Any]] = []
     hint = render_glossary_hint(glossary, for_translation=False)
     if hint:
-        # Appended after the audio so the audio stays the first content item,
-        # which is the shape the documented ASR request uses.
-        content.append({"type": "text", "text": hint.strip()})
+        # A system message is the ONLY channel the real ASR endpoint accepts.
+        # Measured against the live API on 2026-09-12: adding a `text` part
+        # beside the audio -- in either order -- is rejected with
+        # 400 "Param Incorrect", and `asr_options.hotwords` / `asr_options.prompt`
+        # are accepted but silently ignored (output unchanged). The system
+        # message demonstrably works: the same audio transcribed "Itô's lemma"
+        # without it and "Ito's lemma" with it, matching the glossary entry.
+        messages.append({"role": "system", "content": hint.strip()})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": f"data:audio/wav;base64,{encoded}",
+                        "format": "wav",
+                    },
+                }
+            ],
+        }
+    )
     return {
         "model": model,
-        "messages": [{"role": "user", "content": content}],
+        "messages": messages,
         "asr_options": {"language": language},
         "stream": False,
     }

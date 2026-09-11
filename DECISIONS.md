@@ -253,6 +253,13 @@ acceptance or independent verification.
   helping and start crowding the instruction. Providers take a
   `glossary_provider` callable rather than a new protocol argument, so the
   `ASRProvider` / `TranslationProvider` protocols and every mock stay unchanged.
+  **Injection channel, measured live 2026-09-12:** a `system` message is the
+  only one that works. A `text` part beside the audio is rejected outright with
+  400 "Param Incorrect" (either order), and `asr_options.hotwords` /
+  `asr_options.prompt` are accepted but silently ignored. Effect on the real
+  endpoint over three hard clips: **3.1% → 1.7% word error** (-45%); the same
+  audio transcribed "Itô's lemma" without the glossary and "Ito's lemma" with
+  it. Prompt shape (comma list vs dash list) made no measurable difference.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 
