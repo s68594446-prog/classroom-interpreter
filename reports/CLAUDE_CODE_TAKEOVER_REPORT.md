@@ -3,7 +3,7 @@
 **Date:** 2026-09-10
 **Scope:** complete BLOCKING ISSUES 3 and 10; verify the repair candidates for 1–2 and 4–9.
 **Status:** **awaiting independent Codex review. This report does not declare PASS.**
-**Gates:** backend 207 passed · frontend typecheck + build exit 0 · soak reproduced.
+**Gates:** backend 216 passed · frontend typecheck + build exit 0 · soak reproduced.
 
 Every "verified" below means: I read the production code, ran the focused test,
 and re-introduced the original bug to confirm the test turns red. Where a probe
@@ -49,14 +49,13 @@ Root cause (confirmed later, see NEW-3): files in this tree are macOS
 **`dataless`** — contents evicted to iCloud. Reads block on a materialization
 that never completes.
 
-**Resolved.** The owner rebooted; `git commit` works normally again. The commits
-listed below were still produced with plumbing, because they were made while the
-fault was active.
+Every commit made while the fault was active was therefore produced with
+plumbing (`git write-tree` → `git commit-tree` → ref update), which yields an
+identical commit object. That was a workaround for a broken host, not a change
+to how the project is versioned.
 
-Every commit here was therefore produced with plumbing
-(`git write-tree` → `git commit-tree` → ref update), which yields an identical
-commit object. This is a workaround for a broken host, not a change to how the
-project is versioned.
+**Resolved.** The owner rebooted; `git commit` works normally again, and later
+commits use it directly.
 
 ### Commits made during this takeover
 
@@ -88,14 +87,15 @@ PYTHONPATH=backend /private/tmp/classroom-phase2-venv.7Ey9Un/bin/python -m pytes
 
 | | |
 |---|---|
-| Result | **207 passed** |
+| Result | **216 passed** |
 | Failures / errors / skips | 0 / 0 / 0 |
 | Warnings | 1 — upstream `starlette/testclient.py:53` `DeprecationWarning` (`anyio.abc.BlockingPortal` alias). Third-party, not project code. |
 | Wall clock | 26.13 s |
 | Python | 3.13.13 |
 
 Baseline at takeover was 189 passed (184 inherited + 5 added in `7e11e82`).
-The count grew to 207 as coverage gaps were closed. Note: passing `-q` twice
+The count grew to 207 as coverage gaps were closed, then to **216** with the
+nine tests added for the live-provider fixes (D-041, D-042). Note: passing `-q` twice
 (the command line plus `addopts = "-q"`) suppresses the summary line — worth
 knowing when reading CI output from this repo.
 
@@ -106,7 +106,7 @@ fixed the storage fault also wiped `/private/tmp`, destroying the review's
 
 | | |
 |---|---|
-| Result | **203 passed**, 1 warning, 27.40 s, exit 0 |
+| Result | **203 passed**, 1 warning, 27.40 s, exit 0 (the count at that moment) |
 | Python | **3.14.4** (the original run was 3.13.13) |
 | Warning | the same upstream `starlette/testclient.py:53` `DeprecationWarning` |
 
@@ -865,7 +865,7 @@ Both gates that were open when this report was first written are now **closed**:
 | Frontend typecheck / build NOT VERIFIED | **exit 0 / exit 0**, `node_modules` restored |
 | `.env.example` unread | read and manually confirmed — `MIMO_API_KEY=` empty |
 
-Verification state: backend **207 passed** on two independent interpreters
+Verification state: backend **216 passed** on two independent interpreters
 (3.13.13 and a rebuilt 3.14.4 environment), frontend typecheck and build both
 exit 0, soak reproduced after the environment was rebuilt, and the three archived
 soak artifacts pass `shasum -c` against the hashes quoted above.
