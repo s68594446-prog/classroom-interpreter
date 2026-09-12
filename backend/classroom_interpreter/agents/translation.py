@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from classroom_interpreter.agents.context import ContextAgent
-from classroom_interpreter.domain.models import TranslationRequest, utc_now
+from classroom_interpreter.domain.models import (
+    TranslationRequest,
+    TranslationResult,
+    utc_now,
+)
 from classroom_interpreter.providers.base import TranslationProvider
 from classroom_interpreter.providers.errors import ProviderFailure
 from classroom_interpreter.storage.repository import (
@@ -16,6 +21,29 @@ from classroom_interpreter.storage.repository import (
 
 NON_RETRYABLE_CATEGORIES = frozenset({"AUTH", "BALANCE", "CONTENT_FILTER"})
 TRANSLATION_CONTEXT_SNAPSHOT_VERSION = 1
+
+# A lecturer who switches to Chinese mid-sentence still produces an English-
+# majority transcript, so this deliberately requires a clear majority rather
+# than "contains any Chinese". Below the threshold the segment is treated as
+# English with borrowed terms and goes to the translator as usual.
+CHINESE_PASSTHROUGH_RATIO = 0.5
+
+
+def is_predominantly_chinese(text: str) -> bool:
+    """True when the ASR transcript is itself mostly Chinese.
+
+    Real lectures code-switch. When the speaker was talking Chinese, the
+    "English" transcript is Chinese, and translating it again produces a
+    paraphrase less faithful than the original words.
+
+    Punctuation and digits are ignored: "至少是1100亿。" is Chinese even though
+    half its characters are not.
+    """
+    letters = [c for c in text if c.isalpha() or "\u4e00" <= c <= "\u9fff"]
+    if not letters:
+        return False
+    chinese = sum(1 for c in letters if "\u4e00" <= c <= "\u9fff")
+    return chinese / len(letters) > CHINESE_PASSTHROUGH_RATIO
 
 
 @dataclass(slots=True)
@@ -116,6 +144,29 @@ class TranslationAgent:
             context=window,
         )
         started = utc_now()
+        if is_predominantly_chinese(window.current_english_text):
+            # Real lectures code-switch. Measured on a live recording, the
+            # transcript of one segment came back as
+            # "呃，至少是一千一百亿。China is a huge market." -- the lecturer
+            # was speaking Chinese. Sending that to a translator asks it to
+            # translate Chinese into Chinese: it burns a request, adds latency,
+            # and returns a paraphrase that is *less* faithful than what was
+            # actually said. Passing it through keeps the lecturer's own words.
+            result = TranslationResult(
+                segment_id=segment.id,
+                chinese_text=window.current_english_text,
+                english_text_sha256=hashlib.sha256(
+                    window.current_english_text.encode("utf-8")
+                ).hexdigest(),
+                provider="passthrough",
+                model="none",
+                latency_ms=0,
+                created_at=utc_now(),
+            )
+            self._repository.stage_translation_result(
+                segment.session_id, segment.sequence, result
+            )
+            return
         try:
             result = await asyncio.wait_for(
                 self.provider.translate(request),

@@ -278,6 +278,24 @@ acceptance or independent verification.
   remains the only thing the summary ever sees. The cost is roughly one extra
   ASR call per interval per utterance, which is why it is a dial rather than
   a default-on certainty.
+- **D-047 (Real-audio findings)**: Three fixes from the first run against an
+  actual lecture recording (played through speakers, captured by the laptop
+  microphone) rather than synthesized speech.
+  **(a) Code-switching.** Lecturers switch languages mid-class; one segment's
+  "English" transcript came back as "呃，至少是一千一百亿。China is a huge
+  market." Translating a Chinese transcript into Chinese burns a request and
+  returns a paraphrase less faithful than the words actually spoken, so a
+  transcript that is **predominantly** Chinese (>50% of its letters, ignoring
+  digits and punctuation) is passed through untranslated. The threshold is a
+  clear majority, not "contains any Chinese": a mixed sentence still has
+  English that must be translated, and passing it through would leave the
+  reader with no Chinese at all.
+  **(b) Interim audio floor 1200ms → 2500ms.** Measured on the same recording:
+  1.2s of speech transcribed to "8.", 1.5s to "Age.", and only at 2.5s to the
+  correct "The agent commission." Publishing a confident fragment a second
+  earlier is negative value.
+  **(c) Single-word partials suppressed.** A one-token interim reads as fact
+  and is not one.
 
 ## MiMo documentation snapshot (retained from Phase 0)
 

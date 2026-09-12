@@ -60,7 +60,11 @@ class Settings(BaseSettings):
     # it costs extra ASR calls -- roughly one per interval per utterance -- so
     # it is a latency/cost dial, not a free win (D-046).
     partial_transcription_interval_seconds: float = Field(default=2.0, ge=0)
-    partial_transcription_min_audio_ms: int = Field(default=1200, gt=0)
+    # 2500ms, not less. Measured on real classroom audio through a microphone:
+    # 1.2s of speech transcribed to "8.", 1.5s to "Age.", and only at 2.5s did
+    # it become the correct "The agent commission." Showing a wrong fragment
+    # 1s sooner is negative value -- the reader trusts it and it is noise.
+    partial_transcription_min_audio_ms: int = Field(default=2500, gt=0)
     vad_threshold_rms: float = Field(default=300, gt=0)
     context_max_segments: int = Field(default=8, gt=0)
     context_max_seconds: int = Field(default=90, gt=0)

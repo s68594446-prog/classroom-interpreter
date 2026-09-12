@@ -38,6 +38,12 @@ class CaptureStartError(RuntimeError):
     pass
 
 
+# Below this an interim transcript is a fragment, not a phrase. Measured on
+# real classroom audio: under ~2.5s of speech the transcript is a single token
+# like "8." or "Age.", which reads as fact and is not one.
+_MIN_PARTIAL_WORDS = 2
+
+
 class SessionOrchestrator:
     """Coordinates the single active session's lifecycle and its worker loops.
 
@@ -279,6 +285,11 @@ class SessionOrchestrator:
                     continue
                 text = await self.asr_provider.transcribe_bytes(wav)
                 if not text or text == last_text:
+                    continue
+                # Real classroom audio produces one-word fragments ("8.",
+                # "Age.") before there is enough speech to transcribe. Showing
+                # those is worse than showing nothing: the reader believes them.
+                if len(text.split()) < _MIN_PARTIAL_WORDS:
                     continue
                 last_text = text
                 # Ephemeral on purpose: not persisted, not sequenced, so a
