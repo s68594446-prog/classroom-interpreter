@@ -160,3 +160,35 @@ def test_the_check_interval_is_configurable_and_frequent(tmp_path):
     assert settings.capture_check_seconds <= 5, (
         "a slow check means minutes of a class can be lost before anyone is told"
     )
+
+
+def test_the_cause_survives_the_consequence(tmp_path, database):
+    """A later error must not erase the one that explains the session.
+
+    The real sequence, measured on a live run: capture dies at t+23min; ending
+    the class then fails the summary, because the transcript is incomplete --
+    and the summary failure overwrote the capture fault. What the recovery
+    screen said was "summary failed", which is true, useless, and hides the
+    only thing that explains the class.
+
+    Mutation that turns this red: drop the COALESCE from
+    `_record_session_error` so `first_error_*` is overwritten like
+    `last_error_*`.
+    """
+    from classroom_interpreter.storage import SessionRepository
+
+    repository = SessionRepository(database)
+    session_id = repository.create_session("Cause", app_version="test").id
+    repository.update_session_error(
+        session_id, category="CAPTURE", safe_message="microphone capture stopped"
+    )
+    repository.update_session_error(
+        session_id, category="SUMMARY", safe_message="summary failed: X"
+    )
+
+    record = repository.get_session(session_id)
+    assert record.last_error_category == "SUMMARY"
+    assert record.first_error_category == "CAPTURE", (
+        "the consequence overwrote the cause"
+    )
+    assert record.first_error_safe_message == "microphone capture stopped"

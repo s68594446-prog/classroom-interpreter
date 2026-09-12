@@ -52,3 +52,24 @@ def test_broad_runtime_data_directories_are_rejected(unsafe_path: Path) -> None:
             _env_file=None,
             classroom_interpreter_data_dir=unsafe_path,
         )
+
+
+def test_auto_pause_cannot_fire_during_an_ordinary_lecture_pause():
+    """Auto-pause releases the microphone and nothing resumes it by itself.
+
+    So the threshold is not a tuning preference: below a few minutes it turns
+    an ordinary classroom silence -- the lecturer writing on the board, a
+    reading exercise, a VAD threshold that drifted high -- into the permanent
+    end of the recording. Two minutes is a conservative floor for "a person is
+    still teaching"; the shipped default sits far above it.
+
+    Mutation that turns this red: restore `auto_pause_silence_seconds` to its
+    original 30 s default.
+    """
+    from classroom_interpreter.config import Settings
+
+    settings = Settings(_env_file=None)
+    assert settings.auto_pause_silence_seconds >= 120, (
+        "a silence this short happens inside real lectures, and auto-pause is "
+        "not reversible without a person pressing 继续"
+    )

@@ -62,6 +62,11 @@ export interface SessionRecord {
   next_translation_sequence: number;
   last_error_category?: string | null;
   last_error_safe_message?: string | null;
+  // The first error of the session. The last one is usually its consequence:
+  // a capture fault stops the recording, and the summary failure that follows
+  // overwrites it.
+  first_error_category?: string | null;
+  first_error_safe_message?: string | null;
 }
 
 export interface Progress {

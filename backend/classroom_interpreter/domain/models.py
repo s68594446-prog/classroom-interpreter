@@ -82,6 +82,11 @@ class SessionRecord(FrozenModel):
     next_translation_sequence: int = Field(default=0, ge=0)
     last_error_category: str | None = None
     last_error_safe_message: str | None = None
+    # The FIRST error of the session, kept because the last one is usually the
+    # consequence: a capture fault stops the recording, and the summary failure
+    # it causes then overwrites it.
+    first_error_category: str | None = None
+    first_error_safe_message: str | None = None
 
 
 class PurgedSessionMetadata(FrozenModel):

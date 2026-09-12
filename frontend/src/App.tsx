@@ -477,11 +477,17 @@ export function App() {
                 green, and nothing said a word until the class was ended. This
                 has to be loud, and it has to be on the recording screen -- by
                 the time someone reaches the recovery page the class is over. */}
-            {session.last_error_category === "CAPTURE" && (
+            {(session.first_error_category === "CAPTURE" ||
+              session.last_error_category === "CAPTURE") && (
               <p className="capture-fault-banner" role="alert">
                 ⚠️ 录音已中断，之后的声音<strong>没有被录下来</strong>。
-                {session.last_error_safe_message
-                  ? `（${session.last_error_safe_message}）`
+                {session.first_error_safe_message ??
+                session.last_error_safe_message
+                  ? `（${
+                      session.first_error_category === "CAPTURE"
+                        ? session.first_error_safe_message
+                        : session.last_error_safe_message
+                    }）`
                   : ""}
                 请检查麦克风是否被其他程序占用或被拔出，然后结束本节课并重新开始。
                 已经录下的内容都还在。
@@ -534,15 +540,32 @@ export function App() {
                     the whole time, neither of which anyone can see. Showing the
                     category alone still left "处理未能全部完成" as the entire
                     explanation for a class that died of a named fault. */}
-                {session.last_error_safe_message && (
+                {/* The FIRST error, not the last. A capture fault stops the
+                    recording; ending the class then fails the summary because
+                    the transcript is incomplete, and that failure used to
+                    overwrite the fault that caused it -- so the explanation on
+                    screen was "summary failed", which is true and useless. */}
+                {(session.first_error_safe_message ??
+                  session.last_error_safe_message) && (
                   <p className="recovery-reason">
-                    原因：{session.last_error_safe_message}
+                    原因：
+                    {session.first_error_safe_message ??
+                      session.last_error_safe_message}
+                    {session.first_error_safe_message &&
+                    session.last_error_safe_message &&
+                    session.last_error_safe_message !==
+                      session.first_error_safe_message
+                      ? `，随后：${session.last_error_safe_message}`
+                      : ""}
                   </p>
                 )}
                 <p>
                   处理未能全部完成
-                  {session.last_error_category
-                    ? `（${session.last_error_category}）`
+                  {session.first_error_category ?? session.last_error_category
+                    ? `（${
+                        session.first_error_category ??
+                        session.last_error_category
+                      }）`
                     : ""}
                   。已录音频与已翻译内容均已保存。回到首页可选择继续完成处理或删除会话。
                 </p>

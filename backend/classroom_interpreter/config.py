@@ -83,7 +83,23 @@ class Settings(BaseSettings):
     # Auto-pause after a long quiet stretch (break, class ended, mic forgotten).
     # 0 disables it. Must exceed the segment close threshold so an ordinary
     # between-sentence pause can never trip it.
-    auto_pause_silence_seconds: float = Field(default=30, ge=0)
+    #
+    # Ten minutes, not the 30 s this shipped with. Auto-pause releases the
+    # microphone and nothing ever resumes it on its own -- a paused device
+    # cannot hear the class start again -- so whatever this fires on, the rest
+    # of the lecture is lost unless a person notices and presses 继续.
+    #
+    # 30 s is a normal event in a classroom: writing on the board, an exercise,
+    # a question the microphone does not pick up. Worse, it compounds with the
+    # VAD: silence here means "the segmenter heard no speech", so a threshold
+    # that drifts too high (which has happened, and cost a live run) stops
+    # being a few dropped words and becomes a stopped recording. The feature is
+    # meant to catch a microphone left on after everyone leaves, and ten
+    # minutes of unbroken silence says that unambiguously.
+    #
+    # What it costs to wait: ~19 MB of disk per ten minutes of silence. What it
+    # saves: the remainder of a class.
+    auto_pause_silence_seconds: float = Field(default=600, ge=0)
     # Interim transcription of the sentence still being spoken. 0 disables it.
     # This is what makes a caption appear ~2s after speech instead of ~7s, and
     # it costs extra ASR calls -- roughly one per interval per utterance -- so

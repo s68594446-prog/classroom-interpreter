@@ -27,6 +27,31 @@ from classroom_interpreter.domain.state_machines import (
 from .database import Database
 
 
+def _record_session_error(
+    connection, session_id: str, category: str, message: str, now: str
+) -> None:
+    """Record an error against a session, keeping the first one as well.
+
+    `last_error_*` alone loses the cause. A capture fault stops the recording;
+    ending the class then fails the summary because the transcript is
+    incomplete, and that failure overwrites the fault that produced it. The
+    user is told "summary failed" -- true, useless, and hiding the only thing
+    that explains the session. The first error is written once and never
+    overwritten (COALESCE), so both the cause and the symptom survive.
+    """
+    connection.execute(
+        """
+        UPDATE sessions
+        SET last_error_category = ?, last_error_safe_message = ?,
+            first_error_category = COALESCE(first_error_category, ?),
+            first_error_safe_message = COALESCE(first_error_safe_message, ?),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (category, message, category, message, now, session_id),
+    )
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -676,6 +701,7 @@ class SessionRepository:
             """,
             (category, message, now, row["session_id"]),
         )
+        _record_session_error(connection, row["session_id"], category, message, now)
 
     def update_session_error(
         self, session_id: str, *, category: str, safe_message: str
@@ -688,6 +714,9 @@ class SessionRepository:
                 WHERE id = ?
                 """,
                 (category, safe_message, _now_iso(), session_id),
+            )
+            _record_session_error(
+                connection, session_id, category, safe_message, _now_iso()
             )
 
     def commit_asr_result(
@@ -1285,6 +1314,7 @@ class SessionRepository:
             """,
             (category, message, now, row["session_id"]),
         )
+        _record_session_error(connection, row["session_id"], category, message, now)
 
     def expire_leases_for_workers(self, worker_ids: Sequence[str]) -> int:
         """Mark in-flight leases held by definitively stopped workers as expired.
@@ -1545,6 +1575,14 @@ def _insert_transition_audit(
     )
 
 
+def _optional_column(row: sqlite3.Row, name: str):
+    """A column that may not exist yet in an older database file."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 def _session_from_row(row: sqlite3.Row) -> SessionRecord:
     return SessionRecord(
         id=row["id"],
@@ -1561,6 +1599,8 @@ def _session_from_row(row: sqlite3.Row) -> SessionRecord:
         purged_at=(datetime.fromisoformat(row["purged_at"]) if row["purged_at"] else None),
         next_translation_sequence=row["next_translation_sequence"],
         last_error_category=row["last_error_category"],
+        first_error_category=_optional_column(row, "first_error_category"),
+        first_error_safe_message=_optional_column(row, "first_error_safe_message"),
         last_error_safe_message=row["last_error_safe_message"],
     )
 

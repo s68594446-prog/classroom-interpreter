@@ -49,6 +49,10 @@ def _record_dict(record) -> dict:
         "next_translation_sequence": record.next_translation_sequence,
         "last_error_category": getattr(record, "last_error_category", None),
         "last_error_safe_message": getattr(record, "last_error_safe_message", None),
+        # The first error is what explains the session; the last one is often
+        # only its consequence.
+        "first_error_category": getattr(record, "first_error_category", None),
+        "first_error_safe_message": getattr(record, "first_error_safe_message", None),
     }
 
 
