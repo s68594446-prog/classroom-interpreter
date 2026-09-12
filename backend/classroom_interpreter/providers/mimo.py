@@ -344,15 +344,45 @@ def classify_http_status(status: int, headers: Mapping[str, str]) -> ProviderErr
 def _default_post(
     api_key: str, base_url: str, timeout_seconds: float
 ) -> HttpPost:
+    """One keep-alive client per provider, not one per request.
+
+    This opened a fresh `AsyncClient` for every call and closed it again, so
+    every transcription, every translation and every interim caption paid for a
+    new TCP connection and a full TLS handshake -- roughly two extra round
+    trips to the endpoint before a single byte of audio was sent. Interim
+    transcription multiplied the call count by about four, which multiplied the
+    handshakes with it.
+
+    The client is cached per event loop and recreated if the loop changes. It
+    is not a module-level singleton because tests, and the TestClient, each run
+    their own loop, and an httpx client bound to a closed loop fails on its
+    next request.
+    """
+    state: dict = {}
+
     async def post(
         url: str, headers: Mapping[str, str], payload: Mapping[str, Any]
     ) -> ProviderHttpResponse:
+        import asyncio
+
         import httpx2
 
-        async with httpx2.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                url, headers={**headers, "api-key": api_key}, json=dict(payload)
+        loop = asyncio.get_running_loop()
+        client = state.get("client")
+        if client is None or state.get("loop") is not loop or client.is_closed:
+            if client is not None and state.get("loop") is loop and not client.is_closed:
+                await client.aclose()
+            client = httpx2.AsyncClient(
+                timeout=timeout_seconds,
+                limits=httpx2.Limits(
+                    max_keepalive_connections=8, max_connections=16
+                ),
             )
+            state["client"] = client
+            state["loop"] = loop
+        response = await client.post(
+            url, headers={**headers, "api-key": api_key}, json=dict(payload)
+        )
         return ProviderHttpResponse(
             status=response.status_code,
             headers=dict(response.headers),

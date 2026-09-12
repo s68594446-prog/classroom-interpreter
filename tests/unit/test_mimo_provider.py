@@ -429,3 +429,95 @@ def test_interim_keeps_a_sentence_that_merely_contains_think():
     assert strip_interim_scaffolding("thinking about it differently") == (
         "thinking about it differently"
     )
+
+
+def test_the_http_client_is_reused_across_requests(monkeypatch):
+    """A new client per request means a new TLS handshake per request.
+
+    Every ASR call, every translation and every interim caption paid for a
+    fresh TCP connection and a full handshake -- about two extra round trips
+    before any audio was sent -- and interim transcription multiplied the call
+    count, and the handshakes with it.
+
+    Mutation that turns this red: go back to `async with
+    httpx2.AsyncClient(...)` around each request.
+    """
+    import asyncio
+
+    import httpx2
+
+    from classroom_interpreter.providers.mimo import _default_post
+
+    built = []
+
+    class _FakeResponse:
+        status_code = 200
+        headers: dict = {}
+        content = b"{}"
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            built.append(self)
+            self.is_closed = False
+            self.posts = 0
+
+        async def post(self, *args, **kwargs):
+            self.posts += 1
+            return _FakeResponse()
+
+        async def aclose(self):
+            self.is_closed = True
+
+    monkeypatch.setattr(httpx2, "AsyncClient", _FakeClient)
+    post = _default_post("k", "https://example.invalid", 5.0)
+
+    async def exercise():
+        for _ in range(3):
+            await post("https://example.invalid/x", {}, {})
+
+    asyncio.run(exercise())
+
+    assert len(built) == 1, f"opened {len(built)} clients for 3 requests"
+    assert built[0].posts == 3
+
+
+def test_a_client_from_a_dead_event_loop_is_replaced(monkeypatch):
+    """The cache must be per-loop: an httpx client bound to a closed loop
+    fails on its next request, and the TestClient runs its own loop.
+
+    Mutation that turns this red: cache the client globally with no loop check.
+    """
+    import asyncio
+
+    import httpx2
+
+    from classroom_interpreter.providers.mimo import _default_post
+
+    built = []
+
+    class _FakeResponse:
+        status_code = 200
+        headers: dict = {}
+        content = b"{}"
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            built.append(self)
+            self.is_closed = False
+
+        async def post(self, *args, **kwargs):
+            return _FakeResponse()
+
+        async def aclose(self):
+            self.is_closed = True
+
+    monkeypatch.setattr(httpx2, "AsyncClient", _FakeClient)
+    post = _default_post("k", "https://example.invalid", 5.0)
+
+    async def once():
+        await post("https://example.invalid/x", {}, {})
+
+    asyncio.run(once())  # one loop
+    asyncio.run(once())  # a different loop
+
+    assert len(built) == 2
