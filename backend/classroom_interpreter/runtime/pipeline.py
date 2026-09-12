@@ -961,7 +961,19 @@ class SessionOrchestrator:
                 (session_id,),
             ).fetchone()["v"]
         by_state = {row["state"]: row["n"] for row in counts}
-        pending = by_state.get("ASR_PENDING", 0) + by_state.get("ASR_PROCESSING", 0) \
+        # CAPTURED belongs here. It is the state a freshly sealed segment sits
+        # in until an ASR worker leases it, so omitting it made a just-sealed
+        # segment invisible to anything asking "is there work left?".
+        #
+        # The finalization drain asks exactly that. `seal_tail()` runs inside
+        # the drain, produces a CAPTURED segment, and the very next check
+        # reported pending == 0 with no progress -- so the drain broke out and
+        # left it. Every class therefore lost its final segment, and the
+        # summary that followed refused an incomplete transcript and sent the
+        # session to RECOVERY_REQUIRED. Reproduced: 3 DONE, 1 CAPTURED, no
+        # summary job ever created.
+        pending = by_state.get("CAPTURED", 0) \
+            + by_state.get("ASR_PENDING", 0) + by_state.get("ASR_PROCESSING", 0) \
             + by_state.get("ASR_RETRY", 0) + by_state.get("TRANSLATION_PENDING", 0) \
             + by_state.get("TRANSLATION_PROCESSING", 0) + by_state.get("TRANSLATION_RETRY", 0)
         return {

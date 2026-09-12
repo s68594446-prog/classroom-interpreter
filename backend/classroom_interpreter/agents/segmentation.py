@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 import uuid
 import wave
+from functools import wraps
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,6 +119,23 @@ class SealedSegment:
     byte_size: int
 
 
+def _serialized(method):
+    """Serialise the segmenter's public entry points.
+
+    Not defensive boilerplate: the failure being prevented is a segmentation
+    fault in the resampler's C state, which cannot be caught or logged and
+    destroys the recording in progress. A lock is a cheap price for turning a
+    process-killing race into a wait.
+    """
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return call
+
+
 class SegmentAgent:
     """Derives semantic ASR segments from committed capture chunks.
 
@@ -155,6 +174,14 @@ class SegmentAgent:
         self._normalizer: Normalizer | None = None
         self._last_row: dict | None = None
         self._state = SegmenterState()
+        # The resampler underneath `Normalizer` is stateful C code and is not
+        # thread-safe: two threads inside `process_available_chunks` at once
+        # segfaults the interpreter rather than raising, taking the whole
+        # recording down with it. In the running application the segmenter
+        # loop and the finalization drain are kept apart by cancellation
+        # ordering alone, which is a subtle thing to rely on for a failure mode
+        # that cannot be caught, logged, or recovered from.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ state
 
@@ -251,6 +278,7 @@ class SegmentAgent:
             ),
         )
 
+    @_serialized
     def rebuild_unconfirmed_tail(self) -> dict[str, int]:
         """Discard open cursor state and re-derive after the DONE prefix.
 
@@ -341,6 +369,7 @@ class SegmentAgent:
 
     # ------------------------------------------------------------------- main
 
+    @_serialized
     def process_available_chunks(self) -> tuple[SealedSegment, ...]:
         """Consume every committed capture chunk not yet fully consumed and
         return the segments sealed during this call."""
@@ -574,6 +603,7 @@ class SegmentAgent:
         state.discarded_utterances += 1
         return None
 
+    @_serialized
     def pending_utterance_wav(self, *, min_ms: int = 1200) -> bytes | None:
         """In-memory WAV of the utterance currently being spoken, or None.
 
@@ -620,6 +650,7 @@ class SegmentAgent:
         return self._state.silence_run * FRAME_MS
 
 
+    @_serialized
     def seal_tail(self) -> tuple[SealedSegment, ...]:
         """Flush the open utterance (End Class / pause boundary). Voiced
         content is sealed even below the minimum duration; silent tails are

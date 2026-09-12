@@ -249,6 +249,31 @@ def strip_asr_scaffolding(text: str) -> str:
     return result.strip()
 
 
+def strip_interim_scaffolding(text: str) -> str:
+    """Extra, riskier stripping that is only safe for interim captions.
+
+    `strip_asr_scaffolding` deliberately leaves a bare leading "think": at the
+    start of a fragment, a `</think>` remnant and a lecturer saying "I think we
+    should stop here" are indistinguishable, and deleting a speaker's words to
+    tidy a transcript is a permanent loss to fix a cosmetic one.
+
+    That reasoning is about the DURABLE record. An interim caption is replaced
+    within seconds, never persisted, never translated into the committed
+    Chinese and never seen by the summary, so the two errors are not
+    comparable: dropping a word from a throwaway line costs a moment of display,
+    while showing "think whatever happens, whether you succeed" -- observed on
+    real audio -- states that the speaker said "think" when they did not.
+
+    Applied to partials only. The sealed transcript is untouched.
+    """
+    result = strip_asr_scaffolding(text)
+    lowered = result.lower()
+    for prefix in ("think ", "think,", "think."):
+        if lowered.startswith(prefix):
+            return result[len(prefix):].lstrip(" ,.")
+    return result
+
+
 def _malformed(reason: str) -> ProviderFailure:
     return ProviderFailure(
         ProviderError(
@@ -395,7 +420,7 @@ class MimoASRProvider:
             if response.status != 200:
                 return ""
             text, _ = parse_asr_response(response.body)
-            return text
+            return strip_interim_scaffolding(text)
         except (asyncio.TimeoutError, ConnectionError, OSError, ValueError, KeyError):
             # Interim display only: a network or parse failure costs a moment of
             # caption and must never disturb the durable pipeline.

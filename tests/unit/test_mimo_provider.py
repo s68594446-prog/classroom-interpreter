@@ -377,3 +377,55 @@ def test_summary_keeps_provider_side_reasoning():
 
     source = inspect.getsource(mimo_module.MimoSummaryProvider)
     assert "NO_THINKING" not in source
+
+
+def test_interim_strips_a_leading_think_that_the_transcript_keeps():
+    """Observed on real audio: `think whatever happens, whether you succeed`.
+
+    The durable stripper deliberately leaves a bare leading "think", because at
+    the start of a fragment it cannot be told apart from a lecturer saying "I
+    think". That trade-off is right for a permanent record and wrong for a line
+    that is replaced two seconds later and never persisted.
+
+    Mutation that turns this red: return `strip_asr_scaffolding(text)` from
+    `strip_interim_scaffolding`.
+    """
+    from classroom_interpreter.providers.mimo import (
+        strip_asr_scaffolding,
+        strip_interim_scaffolding,
+    )
+
+    raw = "think whatever happens, whether you succeed or you fail"
+    assert strip_asr_scaffolding(raw) == raw, "the durable path must not change"
+    assert strip_interim_scaffolding(raw) == (
+        "whatever happens, whether you succeed or you fail"
+    )
+
+
+def test_interim_stripping_never_touches_the_durable_transcript():
+    """The committed English is the summary's factual source; it is untouched.
+
+    Mutation that turns this red: call `strip_interim_scaffolding` from
+    `parse_asr_response`.
+    """
+    from classroom_interpreter.providers.mimo import parse_asr_response
+
+    body = (
+        '{"choices":[{"message":{"content":'
+        '"think about what the theorem actually means"}}]}'
+    )
+    text, _ = parse_asr_response(body)
+    assert text == "think about what the theorem actually means", (
+        "a lecturer's own word was deleted from the permanent record"
+    )
+
+
+def test_interim_keeps_a_sentence_that_merely_contains_think():
+    from classroom_interpreter.providers.mimo import strip_interim_scaffolding
+
+    assert strip_interim_scaffolding("I think we should stop here") == (
+        "I think we should stop here"
+    )
+    assert strip_interim_scaffolding("thinking about it differently") == (
+        "thinking about it differently"
+    )

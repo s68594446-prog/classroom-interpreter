@@ -56,22 +56,40 @@ def test_partial_loop_is_spawned_when_enabled(tmp_path):
         assert "partial-transcription-loop" in names
 
 
+def standalone_segmenter(tmp_path):
+    """A segmenter nobody else is driving.
+
+    These tests originally reached into the orchestrator's live segmenter and
+    overwrote its state. That races the segmenter loop, which re-derives its
+    state from the durable cursor on every poll -- the assertions passed only
+    because the loop was slow. They are about `pending_utterance_wav`'s own
+    rules, so they get their own agent.
+    """
+    from classroom_interpreter.agents.segmentation import SegmentAgent, SegmenterConfig
+    from classroom_interpreter.storage import Database
+
+    import helpers_phase3 as h
+
+    database = Database(tmp_path / "seg.sqlite3")
+    database.migrate()
+    session_id = h.make_session(database)
+    return SegmentAgent(database, tmp_path / "s" / session_id, session_id,
+                        SegmenterConfig())
+
+
 def test_pending_wav_is_only_offered_mid_utterance(tmp_path):
     """Silence between sentences must not be transcribed as a partial."""
-    client, database, runtime = make_client(tmp_path, auto_purge=False)
-    with client:
-        client.post("/api/sessions", json={"course_name": "Pending"})
-        seg = runtime._segmenter
-        speech = bytearray(b"\x01\x00" * 16000 * 2)  # 2s
+    seg = standalone_segmenter(tmp_path)
+    speech = bytearray(b"\x01\x00" * 16000 * 2)  # 2s
 
-        seg._state = SegmenterState(in_utterance=True, pending_pcm=speech)
-        assert seg.pending_utterance_wav() is not None
+    seg._state = SegmenterState(in_utterance=True, pending_pcm=speech)
+    assert seg.pending_utterance_wav() is not None
 
-        seg._state = SegmenterState(in_utterance=False, pending_pcm=speech)
-        assert seg.pending_utterance_wav() is None, "not speaking -> no partial"
+    seg._state = SegmenterState(in_utterance=False, pending_pcm=speech)
+    assert seg.pending_utterance_wav() is None, "not speaking -> no partial"
 
-        seg._state = SegmenterState(in_utterance=True, pending_pcm=bytearray(b"\x01\x00" * 80))
-        assert seg.pending_utterance_wav() is None, "too little audio -> no partial"
+    seg._state = SegmenterState(in_utterance=True, pending_pcm=bytearray(b"\x01\x00" * 80))
+    assert seg.pending_utterance_wav() is None, "too little audio -> no partial"
 
 
 def test_pending_wav_is_a_valid_standalone_wav(tmp_path):
@@ -79,13 +97,11 @@ def test_pending_wav_is_a_valid_standalone_wav(tmp_path):
     import io
     import wave
 
-    client, database, runtime = make_client(tmp_path, auto_purge=False)
-    with client:
-        client.post("/api/sessions", json={"course_name": "Wav"})
-        runtime._segmenter._state = SegmenterState(
-            in_utterance=True, pending_pcm=bytearray(b"\x01\x00" * 16000 * 2)
-        )
-        data = runtime._segmenter.pending_utterance_wav()
+    seg = standalone_segmenter(tmp_path)
+    seg._state = SegmenterState(
+        in_utterance=True, pending_pcm=bytearray(b"\x01\x00" * 16000 * 2)
+    )
+    data = seg.pending_utterance_wav()
     with wave.open(io.BytesIO(data)) as wav:
         assert wav.getnchannels() == 1
         assert wav.getframerate() == 16000
