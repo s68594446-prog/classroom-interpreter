@@ -23,6 +23,29 @@ model time**. This machine's `OppaVPN` hijacks `api.xiaomimimo.com` to
 198.18.1.106 (an RFC 2544 range used for TUN-mode fake IPs) and routes it
 abroad — MiMo is a domestic Xiaomi service.
 
+> **Correction (2026-09-12, later the same day).** The diagnosis in this
+> section was **wrong**, and it is left here rather than quietly edited because
+> the mistake is instructive.
+>
+> `198.18.x` addresses are not a hijack — they are how TUN-mode proxies
+> normally work. `baidu.com`, `qq.com` and `taobao.com` all resolve to
+> `198.18.x` on this machine and all work fine. I saw a reserved-range address
+> and concluded "broken" without checking whether *any* domain resolved
+> differently.
+>
+> The real cause was timing: the `leaf` proxy core was not running during those
+> tests (it started at 15:05 that day). Routes still sent traffic into
+> `utun233`, but nothing was listening at the other end — hence connect
+> timeouts rather than refusals, and hence `curl --resolve` succeeding, since
+> that path bypassed the tunnel entirely.
+>
+> Verified afterwards with the VPN on and no DNS override: three consecutive
+> calls returned HTTP 200 in 0.88–0.99 s. **No VPN rule change is needed**, and
+> the owner's existing `site:cn → Direct` rule was correct all along. The
+> in-process DNS override used during testing was working around a transient
+> outage, not a misconfiguration.
+
+
 Resolved the real address over DoH (47.237.8.234, Alibaba Cloud Singapore) and
 overrode resolution **inside the test process only**; the repo and production
 code are untouched. Against the real endpoint:

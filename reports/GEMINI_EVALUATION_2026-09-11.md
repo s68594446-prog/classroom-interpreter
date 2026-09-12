@@ -131,3 +131,26 @@ VPN and proxy tools commonly use for TUN-mode fake IPs. General connectivity was
 fine (google.com returned 200), so this is **local proxy/VPN routing on this
 machine, not a MiMo outage**. The MiMo numbers quoted above are from earlier the
 same day, when it was reachable.
+
+
+> **Correction (2026-09-12, later the same day).** The diagnosis in this
+> section was **wrong**, and it is left here rather than quietly edited because
+> the mistake is instructive.
+>
+> `198.18.x` addresses are not a hijack — they are how TUN-mode proxies
+> normally work. `baidu.com`, `qq.com` and `taobao.com` all resolve to
+> `198.18.x` on this machine and all work fine. I saw a reserved-range address
+> and concluded "broken" without checking whether *any* domain resolved
+> differently.
+>
+> The real cause was timing: the `leaf` proxy core was not running during those
+> tests (it started at 15:05 that day). Routes still sent traffic into
+> `utun233`, but nothing was listening at the other end — hence connect
+> timeouts rather than refusals, and hence `curl --resolve` succeeding, since
+> that path bypassed the tunnel entirely.
+>
+> Verified afterwards with the VPN on and no DNS override: three consecutive
+> calls returned HTTP 200 in 0.88–0.99 s. **No VPN rule change is needed**, and
+> the owner's existing `site:cn → Direct` rule was correct all along. The
+> in-process DNS override used during testing was working around a transient
+> outage, not a misconfiguration.
