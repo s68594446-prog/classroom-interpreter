@@ -523,13 +523,41 @@ class SegmentAgent:
         floor = max(min(candidates) if candidates else rms, config.noise_floor_min_rms)
         peak = max(state.level_block_max, state.level_previous_max)
         state.noise_floor_rms = floor
+        if peak < config.threshold_rms:
+            # Nothing in the last five to ten seconds was loud enough to be
+            # speech at all: an empty room, a break, a lecturer who has stopped.
+            #
+            # Without this the geometric mean below is computed from a window
+            # containing ONLY room noise, and the mean of that noise's own
+            # minimum and maximum lands in the middle of the noise. It
+            # manufactures a speech/silence split where there is no speech.
+            # Measured on synthetic room tone at the levels of the real
+            # recording (min 20, median 60, max 140): silent for the first five
+            # seconds while the window still held speech, then 56% of frames
+            # "voiced" for as long as the quiet lasted. The dynamic-range guard
+            # below does not catch it -- noise between 20 and 140 has a range
+            # of 7, comfortably over the 3 it looks for.
+            #
+            # What that cost: utterances open on nothing and run to the 30s
+            # cap, each one a paid transcription of silence; the interim loop
+            # sees a pending utterance forever and pays for an ASR call every
+            # two seconds into an empty room; and the silence run never grows,
+            # so auto-pause can never fire.
+            #
+            # `threshold_rms` is the absolute floor this has always been
+            # documented as -- but it is compared against the window's PEAK,
+            # not against each frame. That distinction is why a fixed threshold
+            # failed before: on a quiet recording (frame p50 393) half the
+            # individual speech frames fall under 300, while the maximum of any
+            # five seconds of real speech is several times it.
+            return config.threshold_rms
         if peak < floor * _MIN_DYNAMIC_RANGE:
-            # The window shows no gap between quiet and loud -- a session that
-            # began mid-sentence, or a speaker who has not paused yet. There is
-            # no evidence on which to place a boundary, so treat the audio as
-            # speech. Over-capturing costs a segment that runs to its maximum
-            # length; under-capturing loses the words entirely, and that is the
-            # failure that actually happened.
+            # The window is loud but shows no gap between quiet and loud: a
+            # speaker who has not paused yet, or a session that began
+            # mid-sentence. There is no evidence on which to place a boundary,
+            # so treat the audio as speech. Over-capturing costs a segment that
+            # runs to its maximum length; under-capturing loses the words
+            # entirely, and that is the failure that actually happened.
             return floor
         return max((floor * peak) ** 0.5, config.noise_floor_min_rms)
 

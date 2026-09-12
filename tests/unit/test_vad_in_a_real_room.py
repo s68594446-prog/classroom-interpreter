@@ -340,3 +340,79 @@ def test_settings_expose_the_new_dials(tmp_path):
     assert settings.vad_voiced_onset_milliseconds > 0
     assert settings.vad_noise_floor_multiplier >= 1.0
     assert settings.segment_preferred_silence_milliseconds > 0
+
+
+def room_tone(seconds: float, seed: int = 20260913):
+    """Frame levels for a room with nobody speaking in it.
+
+    Not silence: a real microphone in a real room produces a floor. These are
+    the levels of the quiet stretches in the measured recording -- minimum
+    around 20, median around 60, maximum around 140.
+    """
+    rng = np.random.default_rng(seed)
+    frames = int(seconds * 1000 / FRAME_MS)
+    return list(rng.normal(60, 15, frames).clip(20, 140))
+
+
+def lecture_levels(seconds: float, seed: int = 20260913):
+    rng = np.random.default_rng(seed + 1)
+    frames = int(seconds * 1000 / FRAME_MS)
+    return list(rng.normal(1700, 400, frames).clip(200, 6000))
+
+
+def test_an_empty_room_does_not_become_speech(database, tmp_path):
+    """The window can hold only noise, and then the geometric mean splits it.
+
+    The threshold is the geometric mean of the window's own minimum and
+    maximum. That is right when the window contains both speech and silence.
+    When the speech ages out -- about ten seconds into a quiet stretch -- the
+    window holds nothing but room tone, and the mean of that tone's minimum and
+    maximum lands in the middle of the tone itself. Measured before the fix:
+    0% of frames voiced for the first five seconds, then 56% for as long as the
+    quiet lasted.
+
+    The dynamic-range guard does not catch this: noise between 20 and 140 has a
+    range of 7, well over the 3 it looks for.
+
+    Every consequence is expensive. Utterances open on nothing and run to the
+    30s cap, each a paid transcription of silence; the interim loop pays for an
+    ASR call every two seconds into an empty room; and the silence run never
+    grows, so auto-pause can never fire.
+
+    Mutation that turns this red: remove the `peak < config.threshold_rms`
+    branch from `_update_threshold`.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
+    voiced = classify(agent, lecture_levels(30.0) + room_tone(40.0))
+    quiet = voiced[int(30.0 * 1000 / FRAME_MS) :]
+    late = quiet[int(10.0 * 1000 / FRAME_MS) :]
+
+    assert sum(late) == 0, (
+        f"{sum(late) / len(late):.0%} of an empty room was heard as speech"
+    )
+
+
+def test_the_empty_room_rule_does_not_deafen_a_quiet_speaker(database, tmp_path):
+    """The rule compares the window's PEAK against the absolute floor, never
+    each frame -- which is the whole reason a fixed per-frame threshold failed.
+
+    These are the levels of the quiet recording named in this module's
+    docstring: frame p50 393, so a third of the speaker's own frames sit under
+    the 300 floor. Their five-second maximum is several times it, so the window
+    rule keeps them audible while a per-frame rule cuts them to pieces.
+
+    Measured: 88% of frames voiced with the window rule, 71% with a per-frame
+    comparison.
+
+    Mutation that turns this red: compare `rms` instead of `peak` against
+    `config.threshold_rms`.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
+    rng = np.random.default_rng(20260913)
+    frames = int(40.0 * 1000 / FRAME_MS)
+    levels = list(rng.normal(393, 177, frames).clip(40, 1375))
+    voiced = classify(agent, levels)
+
+    assert sum(voiced) / len(voiced) > 0.8, (
+        "a quiet speaker was cut to pieces by the empty-room rule"
+    )
