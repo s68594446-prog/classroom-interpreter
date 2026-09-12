@@ -363,6 +363,11 @@ class MimoASRProvider:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self._post = post or _default_post(api_key, self.base_url, timeout_seconds)
+        # This assignment was missing. `transcribe_bytes` called `self._glossary()`
+        # and raised AttributeError on every single call; the blanket `except
+        # Exception: return ""` below turned that into an empty transcript, so
+        # interim captions produced nothing, silently, always.
+        self._glossary = glossary_provider or (lambda: ())
 
     async def transcribe_bytes(self, wav_bytes: bytes) -> str:
         """Transcribe raw WAV for interim display. Returns text, never raises.
@@ -391,7 +396,18 @@ class MimoASRProvider:
                 return ""
             text, _ = parse_asr_response(response.body)
             return text
-        except Exception:
+        except (asyncio.TimeoutError, ConnectionError, OSError, ValueError, KeyError):
+            # Interim display only: a network or parse failure costs a moment of
+            # caption and must never disturb the durable pipeline.
+            #
+            # Deliberately NOT `except Exception`. The AttributeError from the
+            # missing `self._glossary` was raised above this block and swallowed
+            # by the partial loop's own blanket handler, so interim
+            # transcription returned nothing on every call for as long as it
+            # existed and no error was recorded anywhere. Narrowing here stops
+            # this method adding a second place for a plain bug to disappear;
+            # the loop now counts what it catches, so a dead feature shows up as
+            # a fault instead of as silence.
             return ""
 
     async def transcribe(
@@ -399,7 +415,13 @@ class MimoASRProvider:
     ) -> TranscriptResult:
         started = utc_now()
         wav_bytes = segment.audio_path.read_bytes()
-        payload = build_asr_payload(wav_bytes, model=self.model, language=language)
+        # The glossary was plumbed into this class and then never used here, so
+        # D-045 -- per-course terminology, measured at 3.1% -> 1.7% word error
+        # -- was switched on for nobody. The measurement was taken with a direct
+        # probe rather than through this adapter, which is why it looked fine.
+        payload = build_asr_payload(
+            wav_bytes, model=self.model, language=language, glossary=self._glossary()
+        )
         url = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json", "api-key": self.api_key}
         try:

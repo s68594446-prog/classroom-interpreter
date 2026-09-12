@@ -325,9 +325,17 @@ class SessionOrchestrator:
         last_text = ""
         last_translated_text = ""
         last_translated_at = 0.0
+        last_transcribed_at = 0.0
+        # Poll far more often than we transcribe. Sleeping a whole interval
+        # between checks meant an utterance that became long enough just after
+        # a check waited most of another interval before anyone looked -- up to
+        # two seconds of pure phase delay in front of the FIRST caption of every
+        # sentence, which is the one the reader is waiting on. The number of
+        # paid calls is unchanged: it is still governed by `interval` below.
+        poll = min(0.25, interval) if interval else 0.25
         while not self._stop.is_set():
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                await asyncio.wait_for(self._stop.wait(), timeout=poll)
                 return
             except asyncio.TimeoutError:
                 pass
@@ -342,7 +350,14 @@ class SessionOrchestrator:
                 wav = self._segmenter.pending_utterance_wav(min_ms=min_ms)
                 if not wav:
                     last_text = ""
+                    last_transcribed_at = 0.0
                     continue
+                now = time.monotonic()
+                # The first partial of an utterance goes as soon as there is
+                # enough audio; after that, one per interval.
+                if last_text and now - last_transcribed_at < interval:
+                    continue
+                last_transcribed_at = now
                 text = await self.asr_provider.transcribe_bytes(wav)
                 if not text or text == last_text:
                     continue
@@ -379,9 +394,15 @@ class SessionOrchestrator:
                     WebSocketEventKind.SUBTITLE_PARTIAL,
                     {"english_text": text, "chinese_text": chinese},
                 )
-            except Exception:
+            except Exception as exc:
                 # Interim display only; a failed partial must never disturb the
-                # durable pipeline or surface as a session error.
+                # durable pipeline or surface as a session error. But it must
+                # not be invisible either: interim transcription returned empty
+                # text on every call for its entire existence because of an
+                # AttributeError swallowed exactly here, and nothing anywhere
+                # said so. Counting it is content-free and makes a dead feature
+                # show up in /health instead of looking like silence.
+                self._record_worker_fault("partial-transcription", exc)
                 continue
 
     async def _maybe_auto_pause(self) -> None:

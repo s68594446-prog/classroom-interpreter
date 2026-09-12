@@ -111,8 +111,12 @@ def test_a_chinese_partial_reaches_a_websocket_client(tmp_path):
 
     partials = [m for m in seen if m["kind"] == WebSocketEventKind.SUBTITLE_PARTIAL]
     assert partials, "no interim caption reached the client at all"
-    assert partials[-1]["payload"]["chinese_text"] == "风险价值衡量最坏损失"
-    assert partials[-1]["event_sequence"] == EPHEMERAL_EVENT_SEQUENCE
+    # The live partial loop is running too and emits its own English-only
+    # partials, so pick the one this test published rather than the last one.
+    mine = [m for m in partials if m["payload"].get("chinese_text")]
+    assert mine, "no partial carrying Chinese reached the client"
+    assert mine[-1]["payload"]["chinese_text"] == "风险价值衡量最坏损失"
+    assert all(m["event_sequence"] == EPHEMERAL_EVENT_SEQUENCE for m in partials)
 
 
 def test_a_partial_translation_leaves_no_durable_trace(tmp_path):
