@@ -124,17 +124,69 @@ def test_pause_resume_epochs_and_no_silence(database, tmp_path):
         assert conn.execute("SELECT count(*) FROM capture_events WHERE kind='pause'").fetchone()[0] == 2
 
 
-def test_gap_is_explicit_and_fail_closed(database, tmp_path):
+def test_a_small_gap_is_recorded_and_capture_continues(database, tmp_path):
+    """A discontinuity used to end the class. That cost more than it protected.
+
+    Any gap over 100ms raised AUDIO_CONTINUITY_LOST and killed capture for
+    good. On a laptop under load a 100ms scheduling hiccup is an ordinary
+    event: measured in a 29-minute run, one of them stopped recording at
+    t+23.5min and the remaining six minutes were never captured.
+
+    The gap is sealed, timestamped and counted before any of this, so the
+    record already states plainly that audio is missing -- continuing
+    fabricates nothing. What the old behaviour protected was the continuity of
+    the audio already written; what it destroyed was all the audio still to
+    come.
+
+    Mutation that turns this red: raise unconditionally on any gap again.
+    """
     listener = AudioListener(database, tmp_path, rate=16000, synthetic=True)
     listener.begin('gap-test')
     origin = time.monotonic_ns()
     feed(listener, origin=origin)
-    feed(listener, origin=origin + 2_000_000_000)
+    feed(listener, origin=origin + 2_000_000_000)          # a 1.9s gap
+    feed(listener, origin=origin + 2_100_000_000)          # and audio after it
     listener.close()
-    assert listener.state == 'RECOVERY_REQUIRED'
+
     assert listener.gaps == 1
     assert listener.gap_ns == 1_900_000_000
-    assert listener.committed == 1600
+    assert listener.state != 'RECOVERY_REQUIRED', (
+        'a recoverable hiccup ended the session; every later minute of the '
+        'class would have been lost'
+    )
+    assert listener.committed > 1600, 'audio after the gap was not captured'
+
+
+def test_a_large_gap_is_still_fatal(database, tmp_path):
+    """Tolerating a hiccup must not mean tolerating a dead device.
+
+    Mutation that turns this red: remove the `gap_tolerance_ns` check.
+    """
+    listener = AudioListener(database, tmp_path, rate=16000, synthetic=True,
+                             gap_tolerance_seconds=2.0)
+    listener.begin('big-gap')
+    origin = time.monotonic_ns()
+    feed(listener, origin=origin)
+    feed(listener, origin=origin + 30_000_000_000)         # 30 seconds missing
+    listener.close()
+    assert listener.state == 'RECOVERY_REQUIRED'
+    assert listener.fault == 'WRITER_OR_NORMALIZER_FAILED'
+
+
+def test_a_stream_that_keeps_gapping_is_fatal(database, tmp_path):
+    """Each gap small, the stream still broken.
+
+    Mutation that turns this red: remove the `max_tolerated_gaps` check.
+    """
+    listener = AudioListener(database, tmp_path, rate=16000, synthetic=True,
+                             gap_tolerance_seconds=5.0, max_tolerated_gaps=3)
+    listener.begin('many-gaps')
+    origin = time.monotonic_ns()
+    for index in range(10):
+        feed(listener, origin=origin + index * 1_000_000_000)
+    listener.close()
+    assert listener.state == 'RECOVERY_REQUIRED'
+    assert listener.gaps > 3
 
 
 def test_session_ownership_and_async_interface(database, tmp_path):

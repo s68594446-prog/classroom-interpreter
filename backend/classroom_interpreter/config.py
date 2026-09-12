@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     # reads the stream flag and a timestamp, so this is cheap; the cost of
     # NOT running it was six minutes of a class recorded to nowhere.
     capture_check_seconds: float = Field(default=1.0, gt=0, le=60)
+    # A discontinuity in the audio stream is recorded as a gap and tolerated up
+    # to this length. Beyond it the device is treated as broken and capture
+    # stops. Previously ANY discontinuity over 100ms was fatal, which meant one
+    # scheduling hiccup could end a three-hour lecture -- and did end a
+    # 29-minute test run at t+23.5min.
+    capture_gap_tolerance_seconds: float = Field(default=5.0, gt=0, le=120)
+    # ...and a stream that keeps gapping is broken however small each one is.
+    capture_max_tolerated_gaps: int = Field(default=60, ge=0)
     segment_min_seconds: float = Field(default=2, gt=0)
     segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)

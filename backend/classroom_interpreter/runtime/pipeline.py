@@ -154,6 +154,8 @@ class SessionOrchestrator:
                     self.database,
                     capture_root,
                     chunk_seconds=self.settings.capture_chunk_seconds,
+                    gap_tolerance_seconds=self.settings.capture_gap_tolerance_seconds,
+                    max_tolerated_gaps=self.settings.capture_max_tolerated_gaps,
                 )
             await self.listener.start(session_id)
         except Exception:
@@ -621,7 +623,38 @@ class SessionOrchestrator:
         self._assert_active(session_id)
         if self._finalize_task is not None and not self._finalize_task.done():
             return self.repository.get_session(session_id)
-        await asyncio.to_thread(self.listener.close)
+        try:
+            await asyncio.to_thread(self.listener.close)
+        except Exception as exc:
+            # Closing the microphone is not allowed to prevent finishing the
+            # class. If the device has already gone away, `close()` can raise --
+            # and an exception here left the session in RECORDING with no error
+            # recorded, no drain started and no summary, so pressing 结束上课
+            # simply failed and there was no way to finish the class at all.
+            # The audio is already on disk; what remains is to drain and
+            # summarise it, which does not need the device.
+            self._record_worker_fault("capture-close", exc)
+            self.repository.update_session_error(
+                session_id,
+                category="CAPTURE",
+                safe_message=f"microphone did not close cleanly ({type(exc).__name__})",
+            )
+        # RECORDING -> FINALIZING is normally performed by the listener on its
+        # way out, so a listener that raised left the session in RECORDING and
+        # every check in `_finalize` below is guarded on FINALIZING -- the drain
+        # ran and did nothing, and the class could never be completed. The
+        # orchestrator owns session state (AGENTS.md 5); it should not be
+        # delegating this to the device in the first place.
+        if self.repository.get_session(session_id).status in (
+            SessionStatus.RECORDING,
+            SessionStatus.PAUSED,
+        ):
+            self.repository.transition_session(
+                session_id,
+                SessionStatus.FINALIZING,
+                reason_code="END_CLASS_REQUESTED",
+                actor="orchestrator",
+            )
         await self.stop_workers_for_finalization()
         self._finalize_task = asyncio.create_task(
             self._finalize(session_id), name="finalize-drain"

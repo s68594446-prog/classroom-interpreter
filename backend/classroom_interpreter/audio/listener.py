@@ -52,7 +52,8 @@ class AudioListener:
     def __init__(self, database: Database, root: Path, *, device=None,
                  rate: int | None = None, channels: int = 1, queue_blocks: int = 128,
                  chunk_seconds: float = 2, synthetic: bool = False,
-                 min_free_bytes: int = 256 * 1024 * 1024):
+                 min_free_bytes: int = 256 * 1024 * 1024,
+                 gap_tolerance_seconds: float = 5.0, max_tolerated_gaps: int = 60):
         if queue_blocks < 1 or channels not in (1, 2):
             raise ValueError('INVALID_BUFFER_CONFIGURATION')
         self.database, self.repository = database, SessionRepository(database)
@@ -61,6 +62,8 @@ class AudioListener:
         self.device, self.rate, self.channels = device, rate, channels
         self.synthetic, self.chunk_seconds = synthetic, chunk_seconds
         self.min_free_bytes = min_free_bytes
+        self.gap_tolerance_ns = int(gap_tolerance_seconds * 1e9)
+        self.max_tolerated_gaps = max_tolerated_gaps
         self.buffers = queue.Queue(maxsize=queue_blocks)
         self.finished = threading.Event()
         self.accepting = False
@@ -267,7 +270,24 @@ class AudioListener:
                             self.gaps += 1
                             self.gap_ns += abs(delta)
                             self.largest_gap_ns = max(self.largest_gap_ns, abs(delta))
-                            raise RuntimeError('AUDIO_CONTINUITY_LOST')
+                            # The gap is now sealed, timestamped and counted, so
+                            # the record states plainly that audio is missing --
+                            # nothing is fabricated by carrying on.
+                            #
+                            # Ending capture here did not protect that record;
+                            # it destroyed the REST of the class to preserve the
+                            # continuity of the part already written. Measured:
+                            # a single discontinuity 23.5 minutes into a
+                            # 29-minute run stopped recording for good, and
+                            # silently. On a laptop under load a 100ms
+                            # scheduling hiccup is an ordinary event, not a
+                            # broken device.
+                            #
+                            # A genuinely large gap, or a stream that keeps
+                            # gapping, is a different thing and still fatal.
+                            if (abs(delta) > self.gap_tolerance_ns
+                                    or self.gaps > self.max_tolerated_gaps):
+                                raise RuntimeError('AUDIO_CONTINUITY_LOST')
                     wall = (datetime.fromisoformat(frame.wall) + timedelta(
                         seconds=(frame.monotonic_ns - self.epoch_started) / 1e9)).isoformat()
                     before = time.perf_counter()
