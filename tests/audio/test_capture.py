@@ -13,9 +13,12 @@ from classroom_interpreter.audio.listener import AudioListener
 from classroom_interpreter.audio.normalize import Normalizer, normalized_chunks
 
 
-def writer_for(database, repository, tmp_path, *, rate=16000, channels=1):
+def writer_for(database, repository, tmp_path, *, rate=16000, channels=1, seconds=20):
     repository.create_session('synthetic', app_version='test', session_id='audio-test')
-    return ChunkWriter(database, tmp_path / 'audio-test', 'audio-test', rate, channels)
+    # 20s explicitly: these tests assert rollover arithmetic (320000 frames per
+    # chunk), which is about the writer's boundary behaviour and not about what
+    # the product should default to. The default is now 2s for latency.
+    return ChunkWriter(database, tmp_path / 'audio-test', 'audio-test', rate, channels, seconds)
 
 
 def test_rollover_metadata_and_replay(database, repository, tmp_path):
@@ -77,7 +80,7 @@ def test_recover_rename_before_commit(database, repository, tmp_path, monkeypatc
     monkeypatch.setattr(durable, 'commit_chunk', original)
     assert recover(database, writer.root, 'audio-test')['clean']
     assert recover(database, writer.root, 'audio-test')['verified'] == 1
-    restarted = ChunkWriter(database, writer.root, 'audio-test', 16000, 1)
+    restarted = ChunkWriter(database, writer.root, 'audio-test', 16000, 1, 20)
     assert restarted.sequence == 1
 
 

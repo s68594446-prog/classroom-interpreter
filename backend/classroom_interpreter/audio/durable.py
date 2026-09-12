@@ -189,11 +189,23 @@ class ChunkWriter:
     """Single consumer owns this writer. At most one chunk is resident on disk."""
 
     def __init__(self, database: Database, root: Path, session_id: str,
-                 rate: int, channels: int, seconds: int = 20):
-        if rate <= 0 or channels not in (1, 2) or not 10 <= seconds <= 30:
+                 rate: int, channels: int, seconds: float = 2):
+        # The segmenter cannot see audio until a chunk is sealed and committed,
+        # so this value is the product's dominant source of caption latency:
+        # a speaker waits, on average, half a chunk before anything can begin.
+        # The old floor of 10s put an unavoidable ~5s mean delay in front of
+        # every caption, which is why measured end-to-end latency was ~12s while
+        # ASR itself took 1.6s.
+        #
+        # It bought nothing. Sealing costs 2.58ms regardless of chunk length
+        # (four fsyncs and two checksum reads of a small file), so at 1s chunks
+        # the whole durability path is 0.26% of realtime. The floor is now 0.5s,
+        # which is below the VAD silence gap and therefore below the point where
+        # shorter chunks could still help.
+        if rate <= 0 or channels not in (1, 2) or not 0.5 <= seconds <= 30:
             raise ValueError('INVALID_CAPTURE_FORMAT')
         self.database, self.root, self.session_id = database, root.resolve(), session_id
-        self.rate, self.channels, self.limit = rate, channels, rate * seconds
+        self.rate, self.channels, self.limit = rate, channels, int(rate * seconds)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with database.connect() as conn:
             self.sequence = conn.execute('SELECT coalesce(max(sequence), -1)+1 FROM capture_chunks WHERE session_id=?',

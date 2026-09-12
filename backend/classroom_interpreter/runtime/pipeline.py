@@ -23,6 +23,7 @@ from classroom_interpreter.domain.models import (
 from classroom_interpreter.storage import Database, SessionRepository
 from classroom_interpreter.logging import MetadataLogEvent, log_metadata
 
+from .caption_order import CaptionOrderGate
 from .events import EventPublisher
 
 
@@ -88,6 +89,7 @@ class SessionOrchestrator:
         # the UI can distinguish it from a pause the user pressed.
         self.auto_paused_at_silence_seconds: float | None = None
         self.worker_faults: dict[str, dict[str, int | str]] = {}
+        self._caption_gate = CaptionOrderGate(self._publish_caption)
         self.health_store = HealthMetricsStore(
             settings.health_database_path,
             max_buffered=settings.health_buffer_max_samples,
@@ -130,7 +132,11 @@ class SessionOrchestrator:
             else:
                 from classroom_interpreter.audio.listener import AudioListener
 
-                self.listener = AudioListener(self.database, capture_root)
+                self.listener = AudioListener(
+                    self.database,
+                    capture_root,
+                    chunk_seconds=self.settings.capture_chunk_seconds,
+                )
             await self.listener.start(session_id)
         except Exception:
             self.listener = None
@@ -138,6 +144,10 @@ class SessionOrchestrator:
         self.active_session = session_id
         self.last_finalization_error = None
         self.auto_paused_at_silence_seconds = None
+        # Segment sequences restart at 0 for every session, so the gate has to
+        # as well or the first caption of a new class would be held forever
+        # behind the sequence numbers of the previous one.
+        self._caption_gate = CaptionOrderGate(self._publish_caption)
         self._stop.clear()
         self._spawn_workers()
         self.publisher.publish(
@@ -223,12 +233,31 @@ class SessionOrchestrator:
     def _event_sink(self, kind: str, payload: dict) -> None:
         if self.active_session is None:
             return
+        # English captions are published straight from whichever ASR worker
+        # finishes first, so with concurrent workers a later sentence can
+        # overtake an earlier one on screen. Translations never had this
+        # problem: they pass through the durable ordered cursor. The gate gives
+        # the English stream the same guarantee without giving up its speed.
+        if kind == WebSocketEventKind.SUBTITLE_CURRENT and "sequence" in payload:
+            self._caption_gate.offer(int(payload["sequence"]), payload)
+            return
         self.publisher.publish(self.active_session, kind, payload)
+
+    def _publish_caption(self, payload: dict) -> None:
+        if self.active_session is None:
+            return
+        self.publisher.publish(
+            self.active_session, WebSocketEventKind.SUBTITLE_CURRENT, payload
+        )
 
     async def _segmenter_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self._segmenter.process_available_chunks()
+                # A caption held behind a gap that never closes must still
+                # reach the screen; nothing else would release it if the
+                # missing segment is the last one to fail.
+                self._caption_gate.tick()
                 await self._maybe_auto_pause()
             except CorruptCaptureChunk as exc:
                 self.last_finalization_error = "CORRUPT_CAPTURE_CHUNK"
@@ -469,6 +498,9 @@ class SessionOrchestrator:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks = []
+        # The segmenter tick is gone now, so anything the gate is still holding
+        # would never be released. These are real captions for real segments.
+        self._caption_gate.flush()
         worker_ids = [worker.worker_id for worker in getattr(self, "_asr_workers", [])]
         worker_ids += [
             worker.worker_id for worker in getattr(self, "_translation_workers", [])

@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     # still gets bounded output. Streaming was measured and rejected: MiMo's
     # stream produced a *later* first token (p50 3.09s) than a whole
     # non-streamed reply (2.29s), so it buys nothing here (D-043).
+    # How much audio is buffered before it becomes durable and therefore
+    # VISIBLE to the segmenter. This is the product's dominant latency term,
+    # not the model: at the old hard-coded 20s a speaker waited ~10s on average
+    # before processing could even begin, and measured end-to-end English
+    # caption latency was p50 12.2s while ASR itself took 1.6s. Sealing costs
+    # ~1.5ms whatever the length, so short chunks are close to free.
+    capture_chunk_seconds: float = Field(default=2, ge=0.5, le=30)
     segment_min_seconds: float = Field(default=2, gt=0)
     segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)

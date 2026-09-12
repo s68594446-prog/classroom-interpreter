@@ -97,6 +97,15 @@ class SegmentAgent:
         self.config = config or SegmenterConfig()
         self.segments_dir = session_store / "segments"
         self.segments_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # `mode=` applies only when mkdir actually creates the directory, and
+        # never to the parents it creates on the way. The session directory was
+        # therefore left at 0755 while the segments directory beneath it was
+        # 0700 -- the audio was protected by one level of luck.
+        for directory in (self.segments_dir, session_store):
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
         self._normalizer: Normalizer | None = None
         self._last_row: dict | None = None
         self._state = SegmenterState()
@@ -530,6 +539,14 @@ class SegmentAgent:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, final_path)
+            # Recorded classroom speech. Created 0666 & ~umask == 0644 on a
+            # default account; the enclosing 0700 directory is the only thing
+            # that was hiding it, and a mode survives a copy or a backup where
+            # a directory's does not.
+            try:
+                os.chmod(final_path, 0o600)
+            except OSError:
+                pass
             sync_directory(self.segments_dir)
             audio_sha256 = checksum(final_path)
             connection.execute(

@@ -34,8 +34,27 @@ class HealthMetricsStore:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._initialize()
 
+    class _ClosingConnection(sqlite3.Connection):
+        """Commit/rollback AND release the handle on context exit.
+
+        `with sqlite3.connect(...) as connection:` commits or rolls back but
+        does NOT close -- a long-standing trap in the stdlib API. Every flush
+        therefore leaked one open descriptor to the health database until the
+        garbage collector happened to run. A live hour of recording held 102
+        handles to a single file. `storage.database.ClosingConnection` exists
+        for exactly this reason; it simply was never applied here.
+        """
+
+        def __exit__(self, *args):
+            try:
+                return super().__exit__(*args)
+            finally:
+                self.close()
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=0.1)
+        connection = sqlite3.connect(
+            self.path, timeout=0.1, factory=self._ClosingConnection
+        )
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute("PRAGMA busy_timeout = 100")

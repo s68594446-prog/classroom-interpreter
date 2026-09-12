@@ -51,7 +51,7 @@ class AudioListener:
 
     def __init__(self, database: Database, root: Path, *, device=None,
                  rate: int | None = None, channels: int = 1, queue_blocks: int = 128,
-                 chunk_seconds: int = 20, synthetic: bool = False,
+                 chunk_seconds: float = 2, synthetic: bool = False,
                  min_free_bytes: int = 256 * 1024 * 1024):
         if queue_blocks < 1 or channels not in (1, 2):
             raise ValueError('INVALID_BUFFER_CONFIGURATION')

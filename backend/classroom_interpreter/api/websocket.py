@@ -4,7 +4,11 @@ import asyncio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from classroom_interpreter.domain.models import WebSocketEvent, WebSocketEventKind
+from classroom_interpreter.domain.models import (
+    EPHEMERAL_EVENT_SEQUENCE,
+    WebSocketEvent,
+    WebSocketEventKind,
+)
 
 router = APIRouter()
 
@@ -59,10 +63,19 @@ async def session_events(websocket: WebSocket, session_id: str, cursor: int = -1
             else:
                 event = None
                 await asyncio.sleep(0.25)
-            if event is not None and event.event_sequence > last:
-                if not await send(event):
-                    break
-                last = event.event_sequence
+            if event is not None:
+                # Interim captions (D-046) carry EPHEMERAL_EVENT_SEQUENCE, which
+                # is -1. The cursor comparison below starts at the client's
+                # cursor -- also -1 by default -- so `-1 > -1` silently dropped
+                # every partial one layer beneath the code that produced them.
+                # They bypass the cursor entirely and must never advance it,
+                # which is the property that made them ephemeral to begin with.
+                ephemeral = event.event_sequence == EPHEMERAL_EVENT_SEQUENCE
+                if ephemeral or event.event_sequence > last:
+                    if not await send(event):
+                        break
+                    if not ephemeral:
+                        last = event.event_sequence
             if reader.done():
                 message = reader.result()
                 if message == "ping":

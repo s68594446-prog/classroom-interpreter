@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._restrict_permissions()
         connection = sqlite3.connect(self.path, timeout=5, factory=ClosingConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -38,7 +40,37 @@ class Database:
         # content-free ledger persist (D-039). Applies to deletes made on this
         # connection, so it must be set on every connection, not once.
         connection.execute("PRAGMA secure_delete = ON")
+        self._restrict_permissions()
         return connection
+
+    def _restrict_permissions(self) -> None:
+        """Keep the file and its directory owner-only.
+
+        This database holds every transcript, every translation and the replay
+        log -- the most sensitive data the product touches. SQLite creates it
+        with 0666 masked by the process umask, which on a default macOS account
+        is 0644: world-readable. The content-free health database already
+        chmods itself to 0600, so the protection was applied to the one store
+        that did not need it and omitted from the one that did.
+
+        Re-applied on every connect because SQLite recreates the -wal and -shm
+        sidecars, which carry the same content, whenever the file is reopened.
+        Failures are ignored: a session that cannot be tightened is still far
+        better than a session that refuses to record.
+        """
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        for candidate in (
+            self.path,
+            self.path.with_name(self.path.name + "-wal"),
+            self.path.with_name(self.path.name + "-shm"),
+        ):
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError:
+                pass
 
     def migrate(self) -> int:
         with self.connect() as connection:

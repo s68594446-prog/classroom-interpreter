@@ -196,3 +196,90 @@ def test_identical_partials_are_not_republished(tmp_path):
             loop.close()
     assert asr.calls == 3
     assert emitted == 1, "unchanged text must publish once, not every interval"
+
+
+def test_partial_actually_reaches_a_websocket_client(tmp_path):
+    """The gap that made D-046 dead on arrival.
+
+    Every other test here checks the *publisher* fan-out, and the publisher was
+    always correct. The WebSocket endpoint was not: it forwards an event only
+    when `event.event_sequence > last`, `last` starts at the client's cursor
+    (-1 by default), and an ephemeral event's sequence is exactly -1. `-1 > -1`
+    is false, so every interim caption was dropped one layer below the code
+    that produced it.
+
+    Nothing caught it. The publisher tests subscribe to the queue directly, and
+    the latency measurement that reported 6.67s -> 2.32s was taken off that
+    same queue -- so the number was real and the user still saw nothing.
+
+    Mutation that turns this red: restore the bare `event.event_sequence > last`
+    comparison in `api/websocket.py`.
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "WSPartial"}).json()
+        session_id = view["session"]["id"]
+
+        with client.websocket_connect(f"/ws/sessions/{session_id}?cursor=-1") as ws:
+            assert ws.receive_json()["kind"] == "system.ready"
+            runtime.publisher.publish_ephemeral(
+                session_id,
+                WebSocketEventKind.SUBTITLE_PARTIAL,
+                {"english_text": "the agent commission"},
+            )
+            ws.send_text("ping")
+            seen = []
+            while True:
+                message = ws.receive_json()
+                if message["kind"] == "system.pong":
+                    break
+                seen.append(message)
+
+    partials = [m for m in seen if m["kind"] == WebSocketEventKind.SUBTITLE_PARTIAL]
+    assert partials, (
+        "no interim caption reached the client; D-046 produced text that the "
+        "WebSocket layer silently discarded"
+    )
+    assert partials[0]["payload"]["english_text"] == "the agent commission"
+
+
+def test_a_partial_never_advances_the_replay_cursor(tmp_path):
+    """The reason the sequence is -1 in the first place.
+
+    Letting partials through must not cost the property that motivated making
+    them ephemeral: a client's cursor has to keep tracking committed events
+    only, or a reconnect would skip real captions that were never delivered.
+
+    Mutation that turns this red: set `last` from an ephemeral event's sequence
+    in `api/websocket.py`.
+    """
+    client, database, runtime = make_client(tmp_path, auto_purge=False)
+    with client:
+        view = client.post("/api/sessions", json={"course_name": "Cursor"}).json()
+        session_id = view["session"]["id"]
+
+        with client.websocket_connect(f"/ws/sessions/{session_id}?cursor=-1") as ws:
+            assert ws.receive_json()["kind"] == "system.ready"
+            runtime.publisher.publish_ephemeral(
+                session_id,
+                WebSocketEventKind.SUBTITLE_PARTIAL,
+                {"english_text": "interim"},
+            )
+            runtime.publisher.publish(
+                session_id, WebSocketEventKind.SUBTITLE_CURRENT,
+                {"sequence": 0, "segment_id": "s0", "english_text": "committed"},
+            )
+            ws.send_text("ping")
+            seen = []
+            while True:
+                message = ws.receive_json()
+                if message["kind"] == "system.pong":
+                    break
+                seen.append(message)
+
+    kinds = [m["kind"] for m in seen]
+    assert WebSocketEventKind.SUBTITLE_PARTIAL in kinds
+    assert WebSocketEventKind.SUBTITLE_CURRENT in kinds, (
+        "the committed caption published after a partial was swallowed -- the "
+        "partial advanced the cursor past it"
+    )

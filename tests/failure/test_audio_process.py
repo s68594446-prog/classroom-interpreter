@@ -13,6 +13,16 @@ from classroom_interpreter.audio.listener import AudioListener
 from classroom_interpreter.storage import Database
 
 
+# The child submits 1000 blocks of 320 frames at 16kHz = exactly 20 seconds.
+# Capture chunks default to 2 seconds (they used to be hard-coded to 20, which
+# put ~10s of latency in front of every caption), so that audio now seals as
+# ten chunks rather than one. Multi-chunk recovery is the realistic case, so
+# the test exercises it rather than pinning the old single-chunk arithmetic.
+CHUNK_SECONDS = 2
+SUBMITTED_SECONDS = 20
+EXPECTED_CHUNKS = SUBMITTED_SECONDS // CHUNK_SECONDS
+
+
 CHILD = '''
 import sys,time
 from pathlib import Path
@@ -20,7 +30,7 @@ from classroom_interpreter.storage import Database
 from classroom_interpreter.audio.listener import AudioListener
 root=Path(sys.argv[1])
 db=Database(root/'capture.sqlite3'); db.migrate()
-a=AudioListener(db,root,rate=16000,synthetic=True)
+a=AudioListener(db,root,rate=16000,synthetic=True,chunk_seconds=2)
 a.begin('crash')
 origin=time.monotonic_ns()
 for i in range(1000):
@@ -60,7 +70,8 @@ def test_sigkill_previous_chunks_recoverable(database, tmp_path, tail):
         child.stderr.close()
     db = Database(tmp_path / 'capture.sqlite3')
     result = recover(db, tmp_path / 'crash', 'crash')
-    assert result['verified'] == 1 and result['invalid_database_rows'] == 0
+    assert result['verified'] == EXPECTED_CHUNKS
+    assert result['invalid_database_rows'] == 0
     assert result['temporary_files'] == int(tail)
     restarted = AudioListener(db, tmp_path, synthetic=True, rate=16000)
     if tail:
@@ -71,7 +82,12 @@ def test_sigkill_previous_chunks_recoverable(database, tmp_path, tail):
         restarted.submit(b'\0\0'*320, 320, time.monotonic_ns())
         restarted.close()
         with db.connect() as conn:
-            assert [r[0] for r in conn.execute('SELECT sequence FROM capture_chunks ORDER BY sequence')] == [0, 1]
+            sequences = [r[0] for r in conn.execute(
+                'SELECT sequence FROM capture_chunks ORDER BY sequence')]
+            # The property is continuity, not a specific count: the restarted
+            # listener must resume numbering after the recovered chunks with
+            # no gap and no duplicate, whatever the chunk length happens to be.
+            assert sequences == list(range(EXPECTED_CHUNKS + 1))
 
 
 @pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM])
