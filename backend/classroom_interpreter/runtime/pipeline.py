@@ -249,6 +249,7 @@ class SessionOrchestrator:
                 for index, worker in enumerate(self._translation_workers)
             ],
             asyncio.create_task(self._sequencer_loop(), name="translation-sequencer-loop"),
+            asyncio.create_task(self._capture_supervisor_loop(), name="capture-supervisor"),
         ]
         if self.settings.partial_transcription_interval_seconds:
             self._tasks.append(
@@ -404,6 +405,82 @@ class SessionOrchestrator:
                 # show up in /health instead of looking like silence.
                 self._record_worker_fault("partial-transcription", exc)
                 continue
+
+    async def _capture_supervisor_loop(self) -> None:
+        """Notice when the microphone has stopped, and say so.
+
+        `AudioListener.check()` detects a dead stream or a stalled device and
+        raises the capture fault. Nothing in the running application ever called
+        it: the only callers were the standalone audio CLI spike and one test,
+        so in the product the entire detection mechanism was dead code.
+
+        What that cost, measured: during a 29-minute run an ADC discontinuity
+        killed the capture thread at t+23.5min. Recording stopped. The session
+        stayed RECORDING, /health stayed green, the UI showed nothing, and the
+        failure only surfaced six minutes later when the class was ended --
+        by which point the audio was simply gone. For a product whose one job
+        is recording a class, a silent stop is the worst failure it has.
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.settings.capture_check_seconds
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            listener = self.listener
+            session_id = self.active_session
+            if listener is None or session_id is None:
+                continue
+            try:
+                healthy = await asyncio.to_thread(listener.check)
+            except Exception as exc:
+                self._record_worker_fault("capture-supervisor", exc)
+                continue
+            if healthy:
+                continue
+            self._report_capture_fault(session_id, listener)
+            return
+
+    def _report_capture_fault(self, session_id: str, listener) -> None:
+        """Put the capture fault somewhere a person will actually see it.
+
+        The listener already writes the reason into `capture_events` and the
+        state-transition audit, and neither is on screen. The session row's
+        `last_error_*` fields are what the UI reads, and they were left null --
+        so a class that died of a named, recorded fault appeared in the
+        recovery list with no explanation at all.
+        """
+        reason = getattr(listener, "fault", None) or "CAPTURE_STOPPED"
+        detail = getattr(listener, "fault_detail", None)
+        safe_message = "microphone capture stopped" + (
+            f" ({detail})" if detail else ""
+        )
+        try:
+            self.repository.update_session_error(
+                session_id, category="CAPTURE", safe_message=safe_message
+            )
+        except Exception:
+            pass
+        log_metadata(
+            logging.getLogger("classroom_interpreter.runtime"),
+            MetadataLogEvent(
+                agent="capture-supervisor",
+                event="capture_fault",
+                status="failed",
+                session_id=session_id,
+                error_code=str(reason),
+            ),
+        )
+        try:
+            self.publisher.publish(
+                session_id,
+                WebSocketEventKind.SESSION_STATE,
+                self._state_payload(session_id),
+            )
+        except Exception:
+            pass
 
     async def _maybe_auto_pause(self) -> None:
         """Pause recording after a long quiet stretch.

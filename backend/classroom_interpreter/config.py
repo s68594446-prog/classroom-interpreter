@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # short. Sealing and polling are both cheap; the audio is not waiting on
     # either of them.
     segmenter_poll_seconds: float = Field(default=0.1, gt=0, le=5)
+    # How often the microphone is checked for having stopped. `check()` only
+    # reads the stream flag and a timestamp, so this is cheap; the cost of
+    # NOT running it was six minutes of a class recorded to nowhere.
+    capture_check_seconds: float = Field(default=1.0, gt=0, le=60)
     segment_min_seconds: float = Field(default=2, gt=0)
     segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)

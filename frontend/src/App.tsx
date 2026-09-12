@@ -471,6 +471,22 @@ export function App() {
                 已录制的内容都在，按「继续」恢复。
               </p>
             )}
+            {/* A microphone that stops is the worst thing that can happen here
+                and it used to be completely invisible: capture died 23 minutes
+                into a 29-minute run, the status stayed RECORDING, health stayed
+                green, and nothing said a word until the class was ended. This
+                has to be loud, and it has to be on the recording screen -- by
+                the time someone reaches the recovery page the class is over. */}
+            {session.last_error_category === "CAPTURE" && (
+              <p className="capture-fault-banner" role="alert">
+                ⚠️ 录音已中断，之后的声音<strong>没有被录下来</strong>。
+                {session.last_error_safe_message
+                  ? `（${session.last_error_safe_message}）`
+                  : ""}
+                请检查麦克风是否被其他程序占用或被拔出，然后结束本节课并重新开始。
+                已经录下的内容都还在。
+              </p>
+            )}
             <div className="controls">
               <button
                 type="button"
@@ -514,10 +530,19 @@ export function App() {
             {recovery && (
               <div className="recovery-card">
                 <h2>需要恢复</h2>
+                {/* The reason existed in `capture_events` and the audit table
+                    the whole time, neither of which anyone can see. Showing the
+                    category alone still left "处理未能全部完成" as the entire
+                    explanation for a class that died of a named fault. */}
+                {session.last_error_safe_message && (
+                  <p className="recovery-reason">
+                    原因：{session.last_error_safe_message}
+                  </p>
+                )}
                 <p>
                   处理未能全部完成
                   {session.last_error_category
-                    ? `（错误类别：${session.last_error_category}）`
+                    ? `（${session.last_error_category}）`
                     : ""}
                   。已录音频与已翻译内容均已保存。回到首页可选择继续完成处理或删除会话。
                 </p>

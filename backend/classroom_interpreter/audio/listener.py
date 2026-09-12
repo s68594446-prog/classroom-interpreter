@@ -65,6 +65,7 @@ class AudioListener:
         self.finished = threading.Event()
         self.accepting = False
         self.stream = self.worker = self.assertion = self.lock_handle = None
+        self.fault_detail = None
         self.owns_capture = False
         self.writer = None
         self.session_id = None
@@ -279,8 +280,13 @@ class AudioListener:
                     self.buffers.task_done()
             committed(self.writer.seal())
             self.normalized_frames += len(normalizer.process(b'', last=True)) // 2
-        except Exception:
+        except Exception as exc:
+            # Keep the exception type. The reason code alone says a write or a
+            # resample failed and nothing about which, so a capture that stops
+            # mid-class leaves no way to tell a full disk from a lost device
+            # from a bug. The type name is content-free.
             self.fault = self.fault or 'WRITER_OR_NORMALIZER_FAILED'
+            self.fault_detail = self.fault_detail or type(exc).__name__
             self.accepting = False
             self.writer.abandon()
             while True:

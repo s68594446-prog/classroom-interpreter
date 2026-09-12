@@ -518,3 +518,34 @@ button {
 .caption-zh.caption-interim-text {
   font-style: normal;
 }
+
+/* A microphone that has stopped. This is the only failure in the product that
+   destroys data the user cannot get back, so it is the loudest thing on the
+   page -- deliberately heavier than the auto-pause notice next to it, which is
+   merely informational. */
+.capture-fault-banner {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #fdecea;
+  border: 1px solid #f0b7b0;
+  border-left: 4px solid #c0392b;
+  color: #7f231c;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.capture-fault-banner strong { font-weight: 700; }
+.recovery-reason {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #7f231c;
+}
+@media (prefers-color-scheme: dark) {
+  .capture-fault-banner {
+    background: #3a1d1a;
+    border-color: #6b332c;
+    border-left-color: #e06055;
+    color: #f3c9c4;
+  }
+  .recovery-reason { color: #f3c9c4; }
+}
