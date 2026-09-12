@@ -37,6 +37,9 @@ class TranscriptionAgent:
     backoff_cap_seconds: float = 60.0
     request_timeout_seconds: float = 30.0
     jitter_fraction: float = 0.1
+    # The class this worker belongs to. None keeps the historical behaviour of
+    # claiming across every session, which the offline drain tools use.
+    session_id: str | None = None
     event_sink: object | None = None
     last_step_error: str | None = None
     _rng: random.Random = field(default_factory=random.Random, repr=False)
@@ -48,11 +51,12 @@ class TranscriptionAgent:
     async def step(self) -> bool:
         """Run one claim → transcribe → commit cycle. Returns False when no
         work was claimable (callers use this to decide whether to sleep)."""
-        self._repository.promote_captured_segments()
+        self._repository.promote_captured_segments(self.session_id)
         claim = self._repository.claim_next_asr_segment(
             self.worker_id,
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
+            session_id=self.session_id,
         )
         if claim is None:
             return False
@@ -210,6 +214,10 @@ class TranscriptionAgent:
             provider_request_id=result.provider_request_id,
         )
         if outcome.name == "CREATED" and self.event_sink is not None:
+            # The segment's own session, not "whatever is live". A claim can
+            # legitimately come from another class (recovery, offline drain),
+            # and publishing that caption under the live session writes one
+            # class's sentences into another class's durable record.
             self.event_sink(
                 "subtitle.current",
                 {
@@ -217,6 +225,7 @@ class TranscriptionAgent:
                     "segment_id": segment.id,
                     "english_text": result.english_text,
                 },
+                segment.session_id,
             )
 
     def _classify_and_store(

@@ -43,6 +43,11 @@ class SourceHashMismatch(RuntimeError):
     pass
 
 
+# Confines a worker claim to one class. A NULL parameter keeps the historical
+# "any session" behaviour, which recovery drains and the offline tools rely on.
+_SESSION_SCOPE = "AND (:session IS NULL OR session_id = :session)"
+
+
 class CommitOutcome(StrEnum):
     CREATED = "CREATED"
     ALREADY_COMMITTED = "ALREADY_COMMITTED"
@@ -299,15 +304,20 @@ class SessionRepository:
             )
         return self.get_segment(session_id, sequence)
 
-    def promote_captured_segments(self) -> int:
-        """Move all CAPTURED segments to ASR_PENDING (audited). Returns how
-        many rows were promoted."""
+    def promote_captured_segments(self, session_id: str | None = None) -> int:
+        """Move CAPTURED segments to ASR_PENDING (audited). Returns how
+        many rows were promoted.
+
+        `session_id` restricts the sweep to one class. Without it this
+        promotes an abandoned class's leftovers too -- changing rows that
+        nothing is going to work on."""
         now = _now_iso()
         promoted = 0
         with self.database.transaction() as connection:
             rows = connection.execute(
-                "SELECT id, state FROM segments WHERE state = ?",
-                (SegmentState.CAPTURED.value,),
+                "SELECT id, state FROM segments WHERE state = :state "
+                "AND (:session IS NULL OR session_id = :session)",
+                {"state": SegmentState.CAPTURED.value, "session": session_id},
             ).fetchall()
             for row in rows:
                 ensure_segment_transition(
@@ -336,13 +346,19 @@ class SessionRepository:
         *,
         lease_seconds: float,
         max_attempts: int,
+        session_id: str | None = None,
     ) -> SegmentRecord | None:
-        """CAS-claim the next ASR-eligible segment across all sessions.
+        """CAS-claim the next ASR-eligible segment.
 
         Handles pending work, retry/backoff rows whose delay elapsed, and
         expired leases. Rows past the retry budget transition to ASR_FAILED
         instead of being claimed again. Provider calls never run inside this
         transaction.
+
+        `session_id` confines the claim to one class. Unconfined, a worker
+        belonging to the live lecture will happily pick up an abandoned
+        class's backlog -- spending the user's money on audio nobody is
+        watching while the sentence being spoken right now waits behind it.
         """
         now = _now_iso()
         lease_expires = (
@@ -352,7 +368,7 @@ class SessionRepository:
             row = connection.execute(
                 """
                 SELECT * FROM segments
-                WHERE (state = 'ASR_PENDING'
+                WHERE ((state = 'ASR_PENDING'
                            AND (asr_next_attempt_at IS NULL
                                 OR asr_next_attempt_at <= :now))
                    OR (state = 'ASR_RETRY'
@@ -360,11 +376,14 @@ class SessionRepository:
                            AND asr_next_attempt_at <= :now)
                    OR (state = 'ASR_PROCESSING'
                            AND lease_expires_at IS NOT NULL
-                           AND lease_expires_at <= :now)
+                           AND lease_expires_at <= :now))
+                """
+                + _SESSION_SCOPE
+                + """
                 ORDER BY session_id, sequence
                 LIMIT 1
                 """,
-                {"now": now},
+                {"now": now, "session": session_id},
             ).fetchone()
             if row is None:
                 return None
@@ -738,11 +757,15 @@ class SessionRepository:
         *,
         lease_seconds: float,
         max_attempts: int,
+        session_id: str | None = None,
     ) -> SegmentRecord | None:
-        """CAS-claim any translation-eligible segment.
+        """CAS-claim a translation-eligible segment.
 
         Provider work is deliberately not head-of-line ordered. Durable staged
         results are released later by the per-session sequencer (D-034).
+
+        `session_id` confines the claim to one class; see
+        `claim_next_asr_segment` for why that matters during a live lecture.
         """
         now = _now_iso()
         lease_expires = (
@@ -752,16 +775,19 @@ class SessionRepository:
             row = connection.execute(
                 """
                 SELECT * FROM segments
-                WHERE (state = 'TRANSLATION_RETRY'
+                WHERE ((state = 'TRANSLATION_RETRY'
                            AND translation_next_attempt_at IS NOT NULL
                            AND translation_next_attempt_at <= :now)
                    OR (state = 'TRANSLATION_PROCESSING'
                            AND lease_expires_at IS NOT NULL
-                           AND lease_expires_at <= :now)
+                           AND lease_expires_at <= :now))
+                """
+                + _SESSION_SCOPE
+                + """
                 ORDER BY session_id, sequence
                 LIMIT 1
                 """,
-                {"now": now},
+                {"now": now, "session": session_id},
             ).fetchone()
             reclaimed = row is not None
             if row is None:
@@ -769,9 +795,13 @@ class SessionRepository:
                     """
                     SELECT * FROM segments
                     WHERE state = 'ASR_DONE'
+                    """
+                    + _SESSION_SCOPE
+                    + """
                     ORDER BY session_id, sequence
                     LIMIT 1
                     """,
+                    {"session": session_id},
                 ).fetchone()
             if row is None:
                 return None
@@ -987,8 +1017,12 @@ class SessionRepository:
             )
         return CommitOutcome.CREATED
 
-    def release_next_translation_result(self) -> dict | None:
-        """Release one staged result at a session's durable ordered cursor."""
+    def release_next_translation_result(
+        self, session_id: str | None = None
+    ) -> dict | None:
+        """Release one staged result at a session's durable ordered cursor.
+
+        `session_id` confines the release to one class."""
         now = _now_iso()
         with self.database.transaction() as connection:
             row = connection.execute(
@@ -1000,9 +1034,11 @@ class SessionRepository:
                  AND staged.segment_sequence = session.next_translation_sequence
                 JOIN segments seg ON seg.id = staged.segment_id
                 JOIN asr_results asr ON asr.segment_id = staged.segment_id
+                WHERE (:session IS NULL OR staged.session_id = :session)
                 ORDER BY staged.session_id
                 LIMIT 1
-                """
+                """,
+                {"session": session_id},
             ).fetchone()
             if row is None:
                 return None

@@ -67,6 +67,8 @@ class TranslationAgent:
     context_max_segments: int = 8
     context_max_seconds: int = 90
     context_max_tokens: int = 1200
+    # The class this worker belongs to; see TranscriptionAgent.session_id.
+    session_id: str | None = None
     event_sink: object | None = None
     last_step_error: str | None = None
     _rng: random.Random = field(default_factory=random.Random, repr=False)
@@ -87,6 +89,7 @@ class TranslationAgent:
             self.worker_id,
             lease_seconds=self.lease_seconds,
             max_attempts=self.max_attempts,
+            session_id=self.session_id,
         )
         if claim is None:
             return False
@@ -343,6 +346,7 @@ class TranslationSequencer:
     """The sole staged-result → public-result ordered release boundary."""
 
     database: Database
+    session_id: str | None = None
     event_sink: object | None = None
     _repository: SessionRepository = field(init=False, repr=False)
 
@@ -350,10 +354,11 @@ class TranslationSequencer:
         self._repository = SessionRepository(self.database)
 
     async def step(self) -> bool:
-        released = self._repository.release_next_translation_result()
+        released = self._repository.release_next_translation_result(self.session_id)
         if released is None:
             return False
         if self.event_sink is not None:
+            # Published under the session the released row belongs to.
             self.event_sink(
                 "subtitle.committed",
                 {
@@ -362,5 +367,6 @@ class TranslationSequencer:
                     "english_text": released["english_text"],
                     "chinese_text": released["chinese_text"],
                 },
+                released["session_id"],
             )
         return True

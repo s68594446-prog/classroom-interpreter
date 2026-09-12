@@ -201,6 +201,7 @@ class SessionOrchestrator:
                 self.database,
                 self.asr_provider,
                 worker_id=f"asr-{index + 1}",
+                session_id=session_id,
                 lease_seconds=self.settings.asr_lease_seconds,
                 max_attempts=self.settings.asr_max_attempts,
                 backoff_base_seconds=self.settings.asr_backoff_base_seconds,
@@ -216,6 +217,7 @@ class SessionOrchestrator:
                 self.database,
                 self.translation_provider,
                 worker_id=f"translation-{index + 1}",
+                session_id=session_id,
                 lease_seconds=self.settings.translation_lease_seconds,
                 max_attempts=self.settings.translation_max_attempts,
                 backoff_base_seconds=self.settings.translation_backoff_base_seconds,
@@ -229,7 +231,7 @@ class SessionOrchestrator:
             for index in range(self.translation_worker_count)
         ]
         self._translation_sequencer = TranslationSequencer(
-            self.database, event_sink=self._event_sink
+            self.database, session_id=session_id, event_sink=self._event_sink
         )
         # Compatibility handles for focused tests and finalization diagnostics.
         self._asr_worker = self._asr_workers[0]
@@ -258,18 +260,36 @@ class SessionOrchestrator:
                 asyncio.create_task(self._partial_loop(), name="partial-transcription-loop")
             )
 
-    def _event_sink(self, kind: str, payload: dict) -> None:
-        if self.active_session is None:
+    def _event_sink(self, kind: str, payload: dict, session_id: str | None = None) -> None:
+        """Publish one worker result under the session it actually came from.
+
+        This used to publish everything under `self.active_session`, while the
+        claim queries it trusts are global ("the next eligible segment across
+        all sessions"). Those two halves disagree whenever a class is left
+        unfinished -- which is every session that ended in RECOVERY_REQUIRED.
+        The next class's workers picked up the leftovers and wrote last week's
+        sentences into this week's live transcript and into `websocket_events`,
+        the durable replay log, so a reconnect served them again.
+        """
+        session_id = session_id or self.active_session
+        if session_id is None:
             return
         # English captions are published straight from whichever ASR worker
         # finishes first, so with concurrent workers a later sentence can
         # overtake an earlier one on screen. Translations never had this
         # problem: they pass through the durable ordered cursor. The gate gives
         # the English stream the same guarantee without giving up its speed.
-        if kind == WebSocketEventKind.SUBTITLE_CURRENT and "sequence" in payload:
+        #
+        # The gate belongs to the live class; a drain of some other session
+        # has no screen to protect and must not share its sequence counter.
+        if (
+            kind == WebSocketEventKind.SUBTITLE_CURRENT
+            and "sequence" in payload
+            and session_id == self.active_session
+        ):
             self._caption_gate.offer(int(payload["sequence"]), payload)
             return
-        self.publisher.publish(self.active_session, kind, payload)
+        self.publisher.publish(session_id, kind, payload)
 
     def _publish_caption(self, payload: dict) -> None:
         if self.active_session is None:
