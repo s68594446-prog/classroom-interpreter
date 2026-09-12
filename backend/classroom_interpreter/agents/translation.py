@@ -169,6 +169,16 @@ class TranslationAgent:
             self._repository.stage_translation_result(
                 segment.session_id, segment.sequence, result
             )
+            # The claim opened a processing_attempts row; this branch left it
+            # open forever. Every code-switched segment therefore recorded a
+            # translation attempt that never ended, which is exactly the shape
+            # of a hung worker in the audit trail.
+            self._repository.finish_translation_attempt(
+                segment.id,
+                attempt_number=attempt_number,
+                outcome="OK_PASSTHROUGH",
+                latency_ms=0,
+            )
             return
         try:
             result = await asyncio.wait_for(

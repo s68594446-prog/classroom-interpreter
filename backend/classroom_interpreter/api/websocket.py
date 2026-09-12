@@ -63,6 +63,24 @@ async def session_events(websocket: WebSocket, session_id: str, cursor: int = -1
             else:
                 event = None
                 await asyncio.sleep(0.25)
+            if event is not None and event.session_id != session_id:
+                # Subscribers are process-wide, not per-session: the publisher
+                # fans every session's events out to every open socket. A
+                # second tab left on an earlier class was therefore shown the
+                # current class's captions -- interim ones unconditionally,
+                # since they bypass the cursor by design.
+                event = None
+            if getattr(queue, "dropped", False):
+                # Dropped for falling behind. Closing is the repair: the client
+                # reconnects with its cursor and replays what it missed. Close
+                # explicitly rather than just returning -- a connection that is
+                # merely abandoned looks alive to the browser, which is the
+                # failure being fixed.
+                try:
+                    await websocket.close(code=1011)
+                except Exception:
+                    pass
+                break
             if event is not None:
                 # Interim captions (D-046) carry EPHEMERAL_EVENT_SEQUENCE, which
                 # is -1. The cursor comparison below starts at the client's

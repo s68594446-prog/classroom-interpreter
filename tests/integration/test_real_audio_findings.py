@@ -17,6 +17,8 @@ from classroom_interpreter.agents.translation import (
 from classroom_interpreter.config import Settings
 from classroom_interpreter.runtime.pipeline import _MIN_PARTIAL_WORDS
 
+import helpers_phase3 as h
+
 
 # --- Finding 1: lecturers code-switch -------------------------------------
 #
@@ -94,3 +96,42 @@ def test_single_word_partials_are_suppressed():
     assert len("8.".split()) < _MIN_PARTIAL_WORDS
     assert len("Age.".split()) < _MIN_PARTIAL_WORDS
     assert len("The agent commission.".split()) >= _MIN_PARTIAL_WORDS
+
+
+def test_a_passthrough_segment_closes_its_processing_attempt(tmp_path, database):
+    """A code-switched segment must not leave an attempt open forever.
+
+    The claim opens a `processing_attempts` row; every other exit path closes
+    it. The passthrough branch returned without closing, so each Chinese
+    segment recorded a translation attempt with no `finished_at` and no
+    `outcome` -- indistinguishable, in the audit trail, from a worker that hung
+    mid-call.
+
+    Mutation that turns this red: delete the `finish_translation_attempt`
+    call from the passthrough branch in `TranslationAgent._process_claim`.
+    """
+    import asyncio
+
+    from test_translation_pipeline import build_pipeline
+
+    session_id = h.make_session(database, "Code switching")
+    agent = build_pipeline(database, tmp_path, session_id, utterances=1)
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE asr_results SET english_text = ?",
+            ("呃，至少是一千一百亿。",),
+        )
+        connection.commit()
+
+    assert asyncio.run(agent.step()) is True
+
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT outcome, finished_at FROM processing_attempts "
+            "WHERE stage = 'TRANSLATION'"
+        ).fetchone()
+    assert row is not None, "no translation attempt was recorded at all"
+    assert row["finished_at"] is not None, (
+        "the passthrough left its processing attempt open"
+    )
+    assert row["outcome"] == "OK_PASSTHROUGH"

@@ -374,6 +374,17 @@ class SessionOrchestrator:
                 if not wav:
                     last_text = ""
                     last_transcribed_at = 0.0
+                    # The interval is a throttle *within* one sentence: it
+                    # exists so a sentence growing word by word is not
+                    # retranslated for every word. Carrying it across the gap
+                    # between sentences made the first Chinese of every new
+                    # sentence wait out the remainder of the previous
+                    # sentence's interval -- up to three seconds of delay on
+                    # the line the reader is actually waiting for, and no
+                    # requests saved, because that first translation still
+                    # happens, just later. Reset with the utterance.
+                    last_translated_text = ""
+                    last_translated_at = 0.0
                     continue
                 now = time.monotonic()
                 # The first partial of an utterance goes as soon as there is

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 
@@ -9,6 +10,20 @@ from classroom_interpreter.domain.models import (
     WebSocketEventKind,
 )
 from classroom_interpreter.storage import Database
+
+
+class SubscriberQueue(asyncio.Queue):
+    """A subscriber queue that remembers being dropped for falling behind.
+
+    `put_nowait` raises once 1024 events are backed up, which happens when a
+    client stops reading -- a network stall is enough, because the send blocks
+    and the reader stops draining. The publisher then discarded the subscriber
+    silently, and the connection stayed open forever receiving nothing: the UI
+    showed 已连接 over a frozen screen, with no close event to trigger the
+    reconnect that would have replayed the missed events from the cursor.
+    """
+
+    dropped: bool = False
 
 
 @dataclass(slots=True)
@@ -47,12 +62,7 @@ class EventPublisher:
             session_id=session_id,
             payload=payload,
         )
-        for queue in list(self._subscribers):
-            try:
-                queue.put_nowait(event)
-            except Exception:
-                # A dead subscriber never blocks the pipeline.
-                self._subscribers.discard(queue)
+        self._fan_out(event)
         return sequence
 
     def publish_ephemeral(
@@ -75,20 +85,24 @@ class EventPublisher:
             session_id=session_id,
             payload=payload,
         )
+        self._fan_out(event)
+
+    def _fan_out(self, event: WebSocketEvent) -> None:
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(event)
             except Exception:
+                # A dead or hopelessly behind subscriber never blocks the
+                # pipeline -- but it must not be dropped in silence either.
+                # The flag tells the connection to close so the client
+                # reconnects and replays what it missed from its cursor.
+                setattr(queue, "dropped", True)
                 self._subscribers.discard(queue)
 
-    def subscribe(self):
-        queue = set()  # placeholder to satisfy type checkers
-        del queue
-        import asyncio
-
-        q: asyncio.Queue = asyncio.Queue(maxsize=1024)
-        self._subscribers.add(q)
-        return q
+    def subscribe(self) -> SubscriberQueue:
+        queue = SubscriberQueue(maxsize=1024)
+        self._subscribers.add(queue)
+        return queue
 
     def unsubscribe(self, queue) -> None:
         self._subscribers.discard(queue)
