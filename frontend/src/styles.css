@@ -549,3 +549,38 @@ button {
   }
   .recovery-reason { color: #f3c9c4; }
 }
+
+/* Input level. An audio product that hears nothing looks exactly like an audio
+   product in a quiet room; this is the one readout that tells them apart. */
+.level-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+}
+.level-label {
+  color: var(--muted, #667);
+  white-space: nowrap;
+}
+.level-meter {
+  flex: 0 0 120px;
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(128, 128, 128, 0.25);
+  overflow: hidden;
+}
+.level-fill {
+  display: block;
+  height: 100%;
+  transition: width 0.3s linear;
+}
+.level-fill-ok {
+  background: #2e9e5b;
+}
+.level-fill-low {
+  background: #c9871a;
+}
+.level-value {
+  color: var(--muted, #667);
+}

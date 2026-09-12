@@ -1016,7 +1016,20 @@ class SessionOrchestrator:
             "processed_audio_ms": int(done_end),
             "live_delay_ms": max(0, int(captured_end) - int(done_end)),
             "capture_chunks": chunk_count,
+            # What the microphone is actually delivering. Levels only -- no
+            # content -- and the fastest answer to "is it hearing me at all?",
+            # which is the question every failure in this product has raised.
+            "input_level": self._input_level(session_id),
         }
+
+    def _input_level(self, session_id: str) -> dict | None:
+        segmenter = getattr(self, "_segmenter", None)
+        if segmenter is None or session_id != self.active_session:
+            return None
+        try:
+            return segmenter.input_level()
+        except Exception:
+            return None
 
     def _state_payload(self, session_id: str) -> dict:
         record = self.repository.get_session(session_id)

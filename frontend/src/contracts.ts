@@ -77,6 +77,13 @@ export interface Progress {
   processed_audio_ms: number;
   live_delay_ms: number;
   capture_chunks: number;
+  // Levels only, never content. The fastest answer to "is it hearing me?".
+  input_level?: {
+    peak_rms: number;
+    floor_rms: number;
+    speech_floor_rms: number;
+    hearing_speech: boolean;
+  } | null;
 }
 
 export interface CommittedItem {

@@ -665,6 +665,29 @@ class SegmentAgent:
             wav.writeframesraw(pcm)
         return buffer.getvalue()
 
+    def input_level(self) -> dict:
+        """What the segmenter is currently hearing, for display and diagnosis.
+
+        An audio product that hears nothing looks exactly like an audio product
+        in a quiet room, and this one has failed that way more than once. The
+        numbers are levels, never content: an RMS peak, an RMS floor and the
+        threshold between them.
+
+        It also makes the one risk in the empty-room rule diagnosable in a
+        glance. That rule silences a window whose peak is below
+        `threshold_rms`, so a microphone with the input gain turned down would
+        be heard as an empty room -- indistinguishable from an empty room, from
+        the outside, unless the peak itself is on screen.
+        """
+        state = self._state
+        peak = max(state.level_block_max, state.level_previous_max)
+        return {
+            "peak_rms": round(peak, 1),
+            "floor_rms": round(state.noise_floor_rms, 1),
+            "speech_floor_rms": round(self.config.threshold_rms, 1),
+            "hearing_speech": bool(state.in_utterance),
+        }
+
     def idle_silence_ms(self) -> int:
         """Continuous trailing silence, in ms, while no utterance is open.
 

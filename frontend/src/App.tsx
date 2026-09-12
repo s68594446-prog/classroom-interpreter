@@ -516,6 +516,42 @@ export function App() {
                 {endBusy ? "正在收尾…" : "结束上课"}
               </button>
             </div>
+            {/* An audio product that hears nothing looks exactly like an audio
+                product in a quiet room. Every failure this app has had raised
+                the same question -- "is it even hearing me?" -- and there was
+                no way to answer it from the screen. Levels only; no content
+                ever leaves the segmenter here. */}
+            {(recording || paused) && progress?.input_level && (
+              <div className="level-row">
+                <span className="level-label">输入电平</span>
+                <span className="level-meter" aria-hidden="true">
+                  <span
+                    className={
+                      progress.input_level.peak_rms >=
+                      progress.input_level.speech_floor_rms
+                        ? "level-fill level-fill-ok"
+                        : "level-fill level-fill-low"
+                    }
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        (progress.input_level.peak_rms /
+                          (progress.input_level.speech_floor_rms * 6)) *
+                          100,
+                      )}%`,
+                    }}
+                  />
+                </span>
+                <span className="level-value">
+                  {progress.input_level.peak_rms >=
+                  progress.input_level.speech_floor_rms
+                    ? progress.input_level.hearing_speech
+                      ? "正在听到说话"
+                      : "有声音，等待说话"
+                    : "几乎没有声音 · 检查麦克风音量或输入设备"}
+                </span>
+              </div>
+            )}
             {progress && (
               <p className="progress-line">
                 {recording && backlogSeconds > 3 && (
