@@ -72,7 +72,14 @@ export function App() {
   const [termInput, setTermInput] = useState("");
   const [termZh, setTermZh] = useState("");
   const [glossaryOpen, setGlossaryOpen] = useState(false);
-  const [partial, setPartial] = useState<string>("");
+  // The sentence still being spoken. `chineseFor` records which English the
+  // Chinese was translated from, so a stale Chinese line is dropped the
+  // moment the transcriber revises the words underneath it.
+  const [partial, setPartial] = useState<{
+    english: string;
+    chinese: string;
+    chineseFor: string;
+  }>({ english: "", chinese: "", chineseFor: "" });
 
   const cursorRef = useRef(-1);
   const streamEndRef = useRef<HTMLDivElement | null>(null);
@@ -112,17 +119,37 @@ export function App() {
           // Interim text for the sentence still being spoken. Not sequenced,
           // so it never advances the replay cursor; superseded the moment the
           // segment seals.
-          setPartial(String(payload.english_text ?? ""));
+          const english = String(payload.english_text ?? "");
+          const chinese = payload.chinese_text
+            ? String(payload.chinese_text)
+            : undefined;
+          setPartial((previous) => {
+            if (chinese !== undefined) {
+              return { english, chinese, chineseFor: english };
+            }
+            // English arrives first and alone, so the Chinese here belongs to
+            // a shorter prefix of the same sentence. Keep it while it is still
+            // a prefix -- a translation of the first half is right, just
+            // incomplete -- and drop it the moment the transcriber revises
+            // what it heard, because then it is simply wrong.
+            const stillValid =
+              previous.chineseFor !== "" && english.startsWith(previous.chineseFor);
+            return {
+              english,
+              chinese: stillValid ? previous.chinese : "",
+              chineseFor: stillValid ? previous.chineseFor : "",
+            };
+          });
           return;
         }
         if (event.kind === "subtitle.current") {
-          setPartial("");
+          setPartial({ english: "", chinese: "", chineseFor: "" });
           setCurrent({
             sequence: Number(payload.sequence),
             english_text: String(payload.english_text ?? ""),
           });
         } else if (event.kind === "subtitle.committed") {
-          setPartial("");
+          setPartial({ english: "", chinese: "", chineseFor: "" });
           applyCommitted({
             sequence: Number(payload.sequence),
             english_text: String(payload.english_text ?? ""),
@@ -170,6 +197,7 @@ export function App() {
       setProgress(view.progress);
       setCommitted(view.committed_history ?? []);
       setCurrent(null);
+      setPartial({ english: "", chinese: "", chineseFor: "" });
       cursorRef.current = -1;
       connectWs(sessionId);
     },
@@ -347,7 +375,7 @@ export function App() {
       if (distanceFromBottom > 160) return;
     }
     node.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [committed.length, current?.sequence, partial]);
+  }, [committed.length, current?.sequence, partial.english, partial.chinese]);
 
   const elapsedMs = (() => {
     if (!session?.started_at) return 0;
@@ -613,14 +641,28 @@ export function App() {
                 </div>
               </article>
             )}
-            {/* The sentence still being spoken. Appears ~2s behind the
-                speaker, versus ~7s waiting for the segment to seal. Marked
-                visually as provisional so nobody mistakes it for final text. */}
-            {partial && !current && (
+            {/* The sentence still being spoken -- the live line. Appears ~2s
+                behind the speaker instead of waiting for the segment to seal,
+                and the Chinese fills in beneath it a moment later.
+
+                Not gated on `current` any more: while a sealed sentence waits
+                for its translation the speaker is already well into the next
+                one, and hiding the live line for that window made the thing
+                stutter exactly when it should feel continuous. Rendered in
+                dimmed italics and marked 正在识别 so it is never mistaken for
+                the committed record. */}
+            {partial.english && (
               <article className="caption caption-interim" aria-label="正在识别">
                 <span className="caption-seq">·</span>
                 <div className="caption-body">
-                  <p className="caption-en caption-interim-text">{partial}</p>
+                  {partial.chinese && (
+                    <p className="caption-zh caption-interim-text">
+                      {partial.chinese}
+                    </p>
+                  )}
+                  <p className="caption-en caption-interim-text">
+                    {partial.english}
+                  </p>
                 </div>
               </article>
             )}

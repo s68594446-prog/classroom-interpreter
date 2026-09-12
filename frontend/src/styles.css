@@ -509,3 +509,12 @@ button {
 @media (prefers-color-scheme: dark) {
   .caption-interim-text { color: #7d8c86; border-left-color: #39443f; }
 }
+
+/* Chinese has no true italic form. Browsers synthesise one by skewing the
+   glyphs, which on CJK is not a style cue -- it just makes the characters
+   harder to read, and the interim Chinese line is the one the reader is
+   actually trying to follow. Mark it as provisional with colour and the left
+   edge only. */
+.caption-zh.caption-interim-text {
+  font-style: normal;
+}

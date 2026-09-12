@@ -45,6 +45,24 @@ class CaptureStartError(RuntimeError):
 _MIN_PARTIAL_WORDS = 2
 
 
+def _has_moved_enough(previous: str, current: str, min_new_words: int) -> bool:
+    """Has the interim English changed enough to be worth re-translating?
+
+    Every interim translation is a paid call, and the loop sees the same
+    sentence growing word by word. Re-translating for one extra word spends
+    money to change nothing the reader would notice. A shrink or a rewrite --
+    the transcriber revising what it heard -- always counts as movement.
+    """
+    if not previous:
+        return True
+    if not current.startswith(previous):
+        # Not an extension of what we translated -- the transcriber changed its
+        # mind about earlier words ("the agents coming" -> "the agent
+        # commission"). That is exactly when a stale Chinese line is worst.
+        return True
+    return len(current.split()) - len(previous.split()) >= min_new_words
+
+
 class SessionOrchestrator:
     """Coordinates the single active session's lifecycle and its worker loops.
 
@@ -302,7 +320,11 @@ class SessionOrchestrator:
         """
         interval = self.settings.partial_transcription_interval_seconds
         min_ms = self.settings.partial_transcription_min_audio_ms
+        translate_every = self.settings.partial_translation_interval_seconds
+        min_new_words = self.settings.partial_translation_min_new_words
         last_text = ""
+        last_translated_text = ""
+        last_translated_at = 0.0
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
@@ -336,6 +358,26 @@ class SessionOrchestrator:
                     session_id,
                     WebSocketEventKind.SUBTITLE_PARTIAL,
                     {"english_text": text},
+                )
+                # English goes out first and alone. Waiting for the Chinese
+                # would make the English caption as slow as the translation and
+                # give up the whole point of transcribing early.
+                if not translate_every:
+                    continue
+                now = time.monotonic()
+                if now - last_translated_at < translate_every:
+                    continue
+                if not _has_moved_enough(last_translated_text, text, min_new_words):
+                    continue
+                chinese = await self.translation_provider.translate_text(text)
+                if not chinese:
+                    continue
+                last_translated_text = text
+                last_translated_at = time.monotonic()
+                self.publisher.publish_ephemeral(
+                    session_id,
+                    WebSocketEventKind.SUBTITLE_PARTIAL,
+                    {"english_text": text, "chinese_text": chinese},
                 )
             except Exception:
                 # Interim display only; a failed partial must never disturb the

@@ -558,6 +558,47 @@ class MimoTranslationProvider:
         self._post = post or _default_post(api_key, self.base_url, timeout_seconds)
         self._glossary = glossary_provider or (lambda: ())
 
+    async def translate_text(self, english_text: str) -> str:
+        """Translate interim English for display. Returns text, never raises.
+
+        Deliberately mirrors `transcribe_bytes`: it takes a bare string and
+        returns a bare string, with no segment id, no sequence, and no
+        `TranslationResult`. A partial translation therefore has nothing to
+        commit and no `english_text_sha256` to bind, so it cannot be mistaken
+        for -- or accidentally routed into -- the durable record the summary
+        is built from.
+
+        No context window either. Context is a durable, hashed snapshot tied to
+        committed segments (D-035); feeding an uncommitted fragment into it
+        would make that hash depend on text that never existed as a fact.
+        """
+        system_prompt = TRANSLATION_SYSTEM_PROMPT + render_glossary_hint(
+            self._glossary(), for_translation=True
+        )
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": english_text},
+            ],
+            "stream": False,
+            **NO_THINKING,
+        }
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json", "api-key": self.api_key}
+        try:
+            response = await asyncio.wait_for(
+                self._post(url, headers, payload), timeout=self.timeout_seconds
+            )
+            if response.status != 200:
+                return ""
+            text, _ = parse_asr_response(response.body)
+            return (text or "").strip()
+        except Exception:
+            # Display only. A failed partial must never surface as a session
+            # error or disturb the committed pipeline.
+            return ""
+
     async def translate(self, request: TranslationRequest) -> TranslationResult:
         started = utc_now()
         # Appended to the system prompt, not the user content: the user turn

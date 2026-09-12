@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     # it become the correct "The agent commission." Showing a wrong fragment
     # 1s sooner is negative value -- the reader trusts it and it is noise.
     partial_transcription_min_audio_ms: int = Field(default=2500, gt=0)
+    # Interim TRANSLATION of the sentence still being spoken. 0 disables it.
+    #
+    # This is what separates a caption from simultaneous interpretation. While
+    # Chinese only ever comes from a sealed segment, the first word of a 6.5s
+    # sentence waits the whole sentence plus ~3.4s of provider round trip --
+    # about 10s -- before any Chinese exists for it. Translating the open
+    # utterance puts Chinese on screen a few seconds behind the speaker and
+    # keeps correcting it, and the sealed translation still replaces it.
+    #
+    # It is the most expensive dial in the product: every interval is an extra
+    # translation call on top of the extra ASR call partials already cost.
+    # 3s rather than matching the 2s transcription interval, and skipped
+    # entirely unless the English actually moved (below), to keep that bounded.
+    partial_translation_interval_seconds: float = Field(default=3.0, ge=0)
+    # Re-translating for one extra word spends money to change nothing the
+    # reader would notice.
+    partial_translation_min_new_words: int = Field(default=3, ge=1)
     # The absolute floor under the adaptive VAD threshold, not the threshold.
     vad_threshold_rms: float = Field(default=300, gt=0)
     # Speech starts at this multiple of the running noise-floor estimate. The
