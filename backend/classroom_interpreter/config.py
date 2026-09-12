@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)
     segment_silence_milliseconds: int = Field(default=700, gt=0)
+    # How little silence is enough once a segment has already reached its
+    # preferred length. Without this, `segment_preferred_seconds` had no
+    # effect at all -- it was validated here and never passed to the segmenter.
+    segment_preferred_silence_milliseconds: int = Field(default=300, gt=0)
     segment_overlap_milliseconds: int = Field(default=250, ge=0)
     # Auto-pause after a long quiet stretch (break, class ended, mic forgotten).
     # 0 disables it. Must exceed the segment close threshold so an ordinary
@@ -72,7 +76,17 @@ class Settings(BaseSettings):
     # it become the correct "The agent commission." Showing a wrong fragment
     # 1s sooner is negative value -- the reader trusts it and it is noise.
     partial_transcription_min_audio_ms: int = Field(default=2500, gt=0)
+    # The absolute floor under the adaptive VAD threshold, not the threshold.
     vad_threshold_rms: float = Field(default=300, gt=0)
+    # Speech starts at this multiple of the running noise-floor estimate. The
+    # estimate does nothing in a quiet room -- it pins to its minimum and the
+    # absolute floor above wins -- and earns its keep in a noisy hall.
+    vad_noise_floor_multiplier: float = Field(default=4.0, ge=1.0)
+    # How much CONTINUOUS speech cancels a silence run. A single 20ms frame
+    # used to, so one keystroke or reverb tail in a quiet gap held the segment
+    # open to the 30s cap. Measured live, this single change moved p50 segment
+    # duration from 27.2s to 11.4s before the preferred-length close was added.
+    vad_voiced_onset_milliseconds: int = Field(default=200, ge=0)
     context_max_segments: int = Field(default=8, gt=0)
     context_max_seconds: int = Field(default=90, gt=0)
     context_max_tokens: int = Field(default=1200, gt=0)

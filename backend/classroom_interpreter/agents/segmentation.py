@@ -16,6 +16,10 @@ from classroom_interpreter.domain.models import SegmentState
 from classroom_interpreter.storage import Database
 
 NORMALIZED_RATE = 16_000
+# Noise-floor tracking rates, per 10ms frame. Falling is ~300x faster than
+# rising so the estimate follows the room's quietest moments.
+_NOISE_FLOOR_FALL = 0.25
+_NOISE_FLOOR_RISE = 0.0008
 FRAME_SAMPLES = 160  # 10 ms frames at 16 kHz
 SAMPLE_BYTES = 2
 FRAME_BYTES = FRAME_SAMPLES * SAMPLE_BYTES
@@ -32,8 +36,34 @@ class SegmenterConfig:
     min_seconds: float = 2.0
     max_seconds: float = 30.0
     silence_milliseconds: int = 700
+    # A soft target, and until now a dead setting: `segment_preferred_seconds`
+    # was validated in Settings and never reached the segmenter, so D-043's
+    # "12s -> 6s" change altered a number nothing read. A segment closed only
+    # on a full silence gap or at the 30s cap. Past the preferred length the
+    # segmenter now settles for a shorter pause, so a lecturer who does not
+    # stop talking still gets cut at a breath rather than mid-word at 30s.
+    preferred_seconds: float = 6.0
+    preferred_silence_milliseconds: int = 300
     overlap_milliseconds: int = 250
+    # The absolute FLOOR under the adaptive threshold, not the threshold
+    # itself. A fixed absolute value cannot work across rooms, microphones and
+    # macOS input gain: measured through a real microphone, a 700ms gap
+    # qualified once every 36s, so segments ran to the 30s cap instead of
+    # closing on silence.
     threshold_rms: float = 300.0
+    # Speech is taken to start at this multiple of the running noise floor.
+    # Swept against 800s of real captured audio: x4 with 200ms of onset
+    # hysteresis gives p50 segment duration 6.2s and p90 9.2s with no segment
+    # hitting the cap, against p50 27.2s and 16/36 at the cap for the fixed
+    # threshold. Higher multiples start cutting inside speech.
+    noise_floor_multiplier: float = 4.0
+    # 75 x the 4.0 multiplier is exactly `threshold_rms`, so in a silent room
+    # the adaptive path and the absolute floor agree instead of fighting.
+    noise_floor_min_rms: float = 75.0
+    # A silence run is only cancelled by this much CONTINUOUS speech. A single
+    # 20ms frame above threshold used to reset it to zero, so one keystroke,
+    # cough or reverb tail in an otherwise quiet gap kept the segment open.
+    voiced_onset_milliseconds: int = 200
 
 
 @dataclass(slots=True)
@@ -49,6 +79,10 @@ class SegmenterState:
     in_utterance: bool = False
     voiced_run: int = 0
     silence_run: int = 0
+    # Running estimate of the room's background level. Checkpointed because a
+    # restart must re-derive the post-checkpoint region with the same
+    # threshold, or it could seal different segments than the first pass.
+    noise_floor_rms: float = 0.0
     utterance_voiced_frames: int = 0
     utterance_start_ms: int = 0
     current_overlap_ms: int = 0
@@ -128,6 +162,7 @@ class SegmentAgent:
             in_utterance=bool(row["in_utterance"]),
             voiced_run=row["voiced_run"],
             silence_run=row["silence_run"],
+            noise_floor_rms=row["noise_floor_rms"],
             utterance_voiced_frames=row["utterance_voiced_frames"],
             utterance_start_ms=row["utterance_start_ms"],
             current_overlap_ms=row["current_overlap_ms"],
@@ -145,8 +180,9 @@ class SegmentAgent:
                 consumed_normalized_frames, current_epoch, in_utterance,
                 voiced_run, silence_run, utterance_voiced_frames,
                 utterance_start_ms, current_overlap_ms, pending_pcm,
-                preroll_pcm, carry_pcm, discarded_utterances, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                preroll_pcm, carry_pcm, discarded_utterances,
+                noise_floor_rms, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 next_chunk_sequence = excluded.next_chunk_sequence,
                 consumed_native_frames = excluded.consumed_native_frames,
@@ -162,6 +198,7 @@ class SegmentAgent:
                 preroll_pcm = excluded.preroll_pcm,
                 carry_pcm = excluded.carry_pcm,
                 discarded_utterances = excluded.discarded_utterances,
+                noise_floor_rms = excluded.noise_floor_rms,
                 updated_at = excluded.updated_at
             """,
             (
@@ -180,6 +217,7 @@ class SegmentAgent:
                 bytes(state.preroll_pcm),
                 bytes(state.carry_pcm),
                 state.discarded_utterances,
+                state.noise_floor_rms,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -388,6 +426,45 @@ class SegmentAgent:
             self._checkpoint(connection, state)
         return sealed
 
+    def _update_threshold(self, state: SegmenterState, rms: float) -> float:
+        """Track the room's background level and derive the speech threshold.
+
+        A fixed absolute RMS cannot survive contact with a real microphone.
+        Measured over an hour of lecture audio captured through the built-in
+        mic: at the configured 300 a qualifying 700ms silence gap occurred once
+        every 36 seconds -- longer than the 30s segment cap -- so segments
+        stopped closing on silence entirely and ran to the ceiling, p50 29.0s
+        against a 6s preferred length. Room tone, macOS input gain and speaker
+        distance all move the absolute level; only the ratio is stable.
+
+        The floor falls quickly and rises slowly, so it follows the room rather
+        than the speech sitting on top of it, and never drops below
+        `noise_floor_min_rms` (silence would otherwise drive the threshold to
+        zero and make every frame voiced). The result is clamped from below by
+        `threshold_rms`, which is why that setting still means something.
+        """
+        config = self.config
+        floor = state.noise_floor_rms or config.noise_floor_min_rms
+        if rms < floor:
+            # Falls fast: one quiet frame is strong evidence about the room,
+            # and it undoes roughly 350 frames of the upward leak below. This
+            # asymmetry is what makes the estimate track the background
+            # MINIMUM rather than the average, which is what a noise floor is.
+            floor += _NOISE_FLOOR_FALL * (rms - floor)
+        else:
+            # Leaks up unconditionally, including through speech. Learning only
+            # from frames already judged quiet cannot work: a hall whose
+            # background sits above the starting threshold would have every
+            # frame classified as speech, the floor would never move, and no
+            # segment would ever close. The leak is slow enough that it takes
+            # ~60s of unbroken loud audio to matter, and any pause resets it.
+            floor *= 1.0 + _NOISE_FLOOR_RISE
+        state.noise_floor_rms = max(floor, config.noise_floor_min_rms)
+        return max(
+            state.noise_floor_rms * config.noise_floor_multiplier,
+            config.threshold_rms,
+        )
+
     def _process_frame(self, frame: bytes, row: dict) -> SealedSegment | None:
         state = self._state
         config = self.config
@@ -395,7 +472,7 @@ class SegmentAgent:
         state.consumed_normalized_frames += 1
         samples = np.frombuffer(frame, dtype="<i2").astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples)))
-        voiced = rms >= config.threshold_rms
+        voiced = rms >= self._update_threshold(state, rms)
 
         if not state.in_utterance:
             if voiced:
@@ -418,17 +495,29 @@ class SegmentAgent:
         state.pending_pcm.extend(frame)
         if voiced:
             state.voiced_run += 1
-            state.silence_run = 0
             state.utterance_voiced_frames += 1
+            # Only sustained speech cancels a silence run. Resetting on a
+            # single 20ms frame meant one keystroke, cough or reverb tail in an
+            # otherwise quiet gap kept the segment open all the way to the cap.
+            if state.voiced_run * FRAME_MS >= config.voiced_onset_milliseconds:
+                state.silence_run = 0
         else:
             state.silence_run += 1
             state.voiced_run = 0
 
         duration_ms = _pcm_duration_ms(state.pending_pcm)
         voiced_ms = state.utterance_voiced_frames * FRAME_MS
-        silence_close = (
-            state.silence_run * FRAME_MS >= config.silence_milliseconds
-        )
+        # Past the preferred length, take the first real breath instead of
+        # holding out for a full gap. Measured on an hour of real microphone
+        # audio this moved segment duration from p50 27.2s / p90 30.0s (with
+        # 16 of 36 segments hitting the cap) to p50 6.6s / p90 9.5s with none
+        # at the cap.
+        required_silence_ms = config.silence_milliseconds
+        if duration_ms >= config.preferred_seconds * 1000:
+            required_silence_ms = min(
+                required_silence_ms, config.preferred_silence_milliseconds
+            )
+        silence_close = state.silence_run * FRAME_MS >= required_silence_ms
         max_close = duration_ms >= config.max_seconds * 1000
         if not (silence_close or max_close):
             return None

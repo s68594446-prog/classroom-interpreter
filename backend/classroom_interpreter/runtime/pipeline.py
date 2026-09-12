@@ -165,6 +165,13 @@ class SessionOrchestrator:
             silence_milliseconds=self.settings.segment_silence_milliseconds,
             overlap_milliseconds=self.settings.segment_overlap_milliseconds,
             threshold_rms=self.settings.vad_threshold_rms,
+            # This was configured, validated, and never passed here.
+            preferred_seconds=self.settings.segment_preferred_seconds,
+            preferred_silence_milliseconds=(
+                self.settings.segment_preferred_silence_milliseconds
+            ),
+            noise_floor_multiplier=self.settings.vad_noise_floor_multiplier,
+            voiced_onset_milliseconds=self.settings.vad_voiced_onset_milliseconds,
         )
         self._segmenter = SegmentAgent(
             self.database, session_store, session_id, segment_config
