@@ -278,7 +278,9 @@ class SessionOrchestrator:
             except Exception as exc:
                 self._record_worker_fault("segmenter", exc)
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=0.5)
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.settings.segmenter_poll_seconds
+                )
             except asyncio.TimeoutError:
                 continue
 

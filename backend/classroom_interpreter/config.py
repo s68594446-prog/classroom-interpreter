@@ -52,7 +52,13 @@ class Settings(BaseSettings):
     # before processing could even begin, and measured end-to-end English
     # caption latency was p50 12.2s while ASR itself took 1.6s. Sealing costs
     # ~1.5ms whatever the length, so short chunks are close to free.
-    capture_chunk_seconds: float = Field(default=2, ge=0.5, le=30)
+    capture_chunk_seconds: float = Field(default=0.5, ge=0.5, le=30)
+    # How often the segmenter looks for newly committed chunks. It used to be a
+    # fixed 0.5s sleep, which added up to half a second of pure waiting to
+    # every caption -- comparable to the entire capture wait once chunks became
+    # short. Sealing and polling are both cheap; the audio is not waiting on
+    # either of them.
+    segmenter_poll_seconds: float = Field(default=0.1, gt=0, le=5)
     segment_min_seconds: float = Field(default=2, gt=0)
     segment_preferred_seconds: float = Field(default=6, gt=0)
     segment_max_seconds: float = Field(default=30, gt=0)
