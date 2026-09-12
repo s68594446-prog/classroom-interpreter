@@ -74,39 +74,160 @@ def test_a_session_that_starts_mid_sentence_can_still_hear(database, tmp_path):
     assert all(voiced), "recording that starts mid-sentence heard nothing"
 
 
-def test_loud_speech_cannot_drag_the_threshold_above_quiet_speech(database, tmp_path):
-    """Mutation that turns this red: update the floor on every frame."""
-    agent = make_agent(database, tmp_path, h.make_session(database))
-    classify(agent, [6000.0] * 500)          # a long loud passage
-    assert classify(agent, [900.0] * 5)[0], "quiet speech fell below the threshold"
+def lecture_envelope(seconds: float, seed: int = 20260912):
+    """A frame-level loudness curve with the statistics that broke the VAD.
 
+    Measured from the 54 seconds of real audio that produced one translated
+    line and then nothing:
 
-def test_the_floor_rises_to_meet_a_noisy_room(database, tmp_path):
-    """The reason the threshold is adaptive at all.
+        below   75 rms :  4.3% of frames, longest run   30ms
+        below  150 rms : 32.0% of frames, longest run  240ms
+        below  300 rms : 46.8% of frames
 
-    Mutation that turns this red: return `config.threshold_rms` unconditionally.
+    Two properties matter, and an earlier version of this generator had
+    neither, so it passed against the very bug that shipped:
+
+    1. The DEEP dips are extremely brief -- at most 30ms. An estimator that
+       only corrects downward when it sees a frame quieter than itself gets
+       almost no opportunity to correct.
+    2. The recording is not uniform. Its second half was continuously loud:
+       the measured threshold climbed steadily from 300 to 1743 across the
+       last twenty seconds, because nothing in that stretch fell below the
+       rising floor. A generator that puts a clean gap after every phrase
+       hands any estimator a reset it will not get in a real lecture.
     """
-    agent = make_agent(database, tmp_path, h.make_session(database),
-                       threshold_rms=300.0, noise_floor_multiplier=4.0)
+    import random
+
+    rng = random.Random(seed)
+    out = []
+    total = int(seconds * 100)
+    # First third: ordinary speech with real gaps between phrases.
+    while len(out) < total // 3:
+        for _ in range(rng.randint(60, 140)):
+            out.append(rng.uniform(600, 2400))
+        for _ in range(rng.randint(8, 24)):
+            out.append(rng.uniform(150, 260))
+        if rng.random() < 0.35:
+            for _ in range(rng.randint(1, 3)):
+                out.append(rng.uniform(60, 80))
+    # Remainder: a speaker who does not stop. Dips stay shallow -- breaths and
+    # syllable boundaries, never silence.
+    while len(out) < total:
+        for _ in range(rng.randint(80, 200)):
+            out.append(rng.uniform(700, 2600))
+        for _ in range(rng.randint(3, 10)):
+            out.append(rng.uniform(320, 520))
+    return out[:total]
+
+
+def test_the_threshold_can_never_exceed_the_signal_for_long(database, tmp_path):
+    """THE regression test. This is the failure that reached the owner.
+
+    The previous estimator leaked upward exponentially with no upper bound.
+    Over 54 seconds of real continuous speech it drove the threshold from 300
+    to 1743 -- above the speaker's own level -- and segmentation stopped dead
+    after the first sentence: one translated line in a minute of audio.
+
+    The tests that existed ran a few hundred frames against a forgiving
+    synthetic pattern, and a drift that takes tens of seconds to matter is
+    invisible to both.
+
+    Mutation that turns this red: replace the windowed min/max with an
+    unbounded accumulator, e.g. `floor *= 1.0008` on every loud frame.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
     state = agent._state
-    for _ in range(4000):
-        agent._update_threshold(state, 900.0)   # sustained room tone
-    assert agent._update_threshold(state, 900.0) > 900.0, (
-        "a room whose background sits at 900 would have every frame treated "
-        "as speech, and no segment would ever close"
+    levels = lecture_envelope(90)
+    heard = 0
+    worst = 0.0
+    WARMUP = 1000                                    # 10s to fill the window
+    for index, level in enumerate(levels):
+        threshold = agent._update_threshold(state, level)
+        if level >= threshold:
+            heard += 1
+        if index < WARMUP:
+            # Before the window has seen a quiet stretch the threshold sits at
+            # the signal itself, which makes everything voiced -- the safe
+            # direction, and not what this test is about.
+            continue
+        worst = max(worst, threshold)
+        assert threshold <= 1200, (
+            f"at {index / 100:.1f}s the threshold reached {threshold:.0f}, "
+            "climbing into the speech band (600-2400) it is supposed to "
+            "detect -- this is the unbounded drift that stopped segmentation "
+            "after one sentence"
+        )
+    speech_frames = sum(1 for v in levels if v >= 600)
+    assert heard >= speech_frames * 0.9, (
+        f"only {heard} of {speech_frames} speech frames were heard; the "
+        f"threshold peaked at {worst:.0f}"
     )
 
 
-def test_a_quiet_room_behaves_exactly_like_the_fixed_threshold(database, tmp_path):
-    """Adaptivity must not change anything when it is not needed."""
+def test_quiet_playback_is_still_heard(database, tmp_path):
+    """Two real recordings, one segmented correctly and one produced ZERO
+    segments with the same absolute threshold.
+
+    Their frame levels: p5=93 / p50=1706 for the loud one, p5=77 / p50=393 for
+    the quiet one. A threshold calibrated for the first sits above the median
+    frame of the second. Only the RATIO between background and speech is
+    stable across playback volume and microphone distance.
+
+    Mutation that turns this red: return a constant `config.threshold_rms`.
+    """
     agent = make_agent(database, tmp_path, h.make_session(database))
     state = agent._state
-    for _ in range(500):
-        agent._update_threshold(state, 0.0)
-    assert agent._update_threshold(state, 0.0) == pytest.approx(300.0)
+    rng = __import__("random").Random(7)
+    heard = 0
+    for index in range(3000):
+        level = 77.0 if index % 100 < 20 else rng.uniform(300, 600)   # the quiet recording
+        threshold = agent._update_threshold(state, level)
+        if level >= threshold:
+            heard += 1
+    assert heard > 1500, (
+        "a quietly played recording was treated as silence throughout, which "
+        "is exactly what produced zero segments from 54 seconds of audio"
+    )
 
 
-# -------------------------------------------------------------- hysteresis
+def test_a_noisy_room_raises_the_threshold(database, tmp_path):
+    """The reason the threshold is adaptive at all.
+
+    A hall whose background sits at 900 must not have every frame treated as
+    speech, or no segment would ever close.
+
+    Mutation that turns this red: return `config.threshold_rms` unconditionally.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
+    state = agent._state
+    rng = __import__("random").Random(11)
+    for index in range(3000):
+        level = 900.0 if index % 100 < 30 else rng.uniform(2500, 5000)
+        threshold = agent._update_threshold(state, level)
+    assert threshold > 900.0, (
+        "background at 900 would be treated as speech and segments would never "
+        "close on silence"
+    )
+
+
+def test_the_threshold_recovers_after_a_loud_passage(database, tmp_path):
+    """Bounded is not enough; it also has to come back down.
+
+    After a loud stretch the estimate must fall far enough to hear normal
+    speech again, and within seconds rather than minutes.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
+    state = agent._state
+    for _ in range(2000):
+        agent._update_threshold(state, 6000.0)
+    heard = 0
+    for _ in range(1500):                            # 15s of ordinary speech
+        threshold = agent._update_threshold(state, 700.0)
+        if 700.0 >= threshold:
+            heard += 1
+    assert heard > 500, (
+        "after a loud passage the segmenter stayed deaf to ordinary speech"
+    )
 
 
 def test_a_single_loud_frame_does_not_cancel_a_silence_run(database, tmp_path):

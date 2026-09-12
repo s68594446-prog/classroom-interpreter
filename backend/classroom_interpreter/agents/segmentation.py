@@ -16,10 +16,15 @@ from classroom_interpreter.domain.models import SegmentState
 from classroom_interpreter.storage import Database
 
 NORMALIZED_RATE = 16_000
-# Noise-floor tracking rates, per 10ms frame. Falling is ~300x faster than
-# rising so the estimate follows the room's quietest moments.
-_NOISE_FLOOR_FALL = 0.25
-_NOISE_FLOOR_RISE = 0.0008
+# Level tracking runs on 5-second blocks, so the floor and peak are always the
+# minimum and maximum of samples actually observed in the last 5-10 seconds.
+# That bound is the whole point: an exponential leak with no upper bound ran
+# the threshold from 300 to 1743 over 54 seconds of real speech and started
+# classifying the speaker as silence.
+_LEVEL_BLOCK_FRAMES = 500
+# Below this ratio between the window's loudest and quietest frame there is
+# no observed distinction between speech and silence to place a threshold in.
+_MIN_DYNAMIC_RANGE = 3.0
 FRAME_SAMPLES = 160  # 10 ms frames at 16 kHz
 SAMPLE_BYTES = 2
 FRAME_BYTES = FRAME_SAMPLES * SAMPLE_BYTES
@@ -57,9 +62,11 @@ class SegmenterConfig:
     # hitting the cap, against p50 27.2s and 16/36 at the cap for the fixed
     # threshold. Higher multiples start cutting inside speech.
     noise_floor_multiplier: float = 4.0
-    # 75 x the 4.0 multiplier is exactly `threshold_rms`, so in a silent room
-    # the adaptive path and the absolute floor agree instead of fighting.
-    noise_floor_min_rms: float = 75.0
+    # Only a guard against digital silence driving the threshold to zero, not
+    # a calibration point. It must stay well below any real speech level: at 75
+    # with a x4 multiplier the effective minimum was 300, which is above the
+    # median frame of a quietly played recording and produced zero segments.
+    noise_floor_min_rms: float = 30.0
     # A silence run is only cancelled by this much CONTINUOUS speech. A single
     # 20ms frame above threshold used to reset it to zero, so one keystroke,
     # cough or reverb tail in an otherwise quiet gap kept the segment open.
@@ -79,10 +86,15 @@ class SegmenterState:
     in_utterance: bool = False
     voiced_run: int = 0
     silence_run: int = 0
-    # Running estimate of the room's background level. Checkpointed because a
-    # restart must re-derive the post-checkpoint region with the same
-    # threshold, or it could seal different segments than the first pass.
+    # Windowed level statistics. Checkpointed because a restart must re-derive
+    # the post-checkpoint region with the same threshold, or it could seal
+    # different segments than the first pass.
     noise_floor_rms: float = 0.0
+    level_block_index: int = 0
+    level_block_min: float = 0.0
+    level_block_max: float = 0.0
+    level_previous_min: float = 0.0
+    level_previous_max: float = 0.0
     utterance_voiced_frames: int = 0
     utterance_start_ms: int = 0
     current_overlap_ms: int = 0
@@ -163,6 +175,11 @@ class SegmentAgent:
             voiced_run=row["voiced_run"],
             silence_run=row["silence_run"],
             noise_floor_rms=row["noise_floor_rms"],
+            level_block_index=row["level_block_index"],
+            level_block_min=row["level_block_min"],
+            level_block_max=row["level_block_max"],
+            level_previous_min=row["level_previous_min"],
+            level_previous_max=row["level_previous_max"],
             utterance_voiced_frames=row["utterance_voiced_frames"],
             utterance_start_ms=row["utterance_start_ms"],
             current_overlap_ms=row["current_overlap_ms"],
@@ -181,8 +198,10 @@ class SegmentAgent:
                 voiced_run, silence_run, utterance_voiced_frames,
                 utterance_start_ms, current_overlap_ms, pending_pcm,
                 preroll_pcm, carry_pcm, discarded_utterances,
-                noise_floor_rms, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                noise_floor_rms, level_block_index, level_block_min,
+                level_block_max, level_previous_min, level_previous_max,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 next_chunk_sequence = excluded.next_chunk_sequence,
                 consumed_native_frames = excluded.consumed_native_frames,
@@ -199,6 +218,11 @@ class SegmentAgent:
                 carry_pcm = excluded.carry_pcm,
                 discarded_utterances = excluded.discarded_utterances,
                 noise_floor_rms = excluded.noise_floor_rms,
+                level_block_index = excluded.level_block_index,
+                level_block_min = excluded.level_block_min,
+                level_block_max = excluded.level_block_max,
+                level_previous_min = excluded.level_previous_min,
+                level_previous_max = excluded.level_previous_max,
                 updated_at = excluded.updated_at
             """,
             (
@@ -218,6 +242,11 @@ class SegmentAgent:
                 bytes(state.carry_pcm),
                 state.discarded_utterances,
                 state.noise_floor_rms,
+                state.level_block_index,
+                state.level_block_min,
+                state.level_block_max,
+                state.level_previous_min,
+                state.level_previous_max,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -427,43 +456,53 @@ class SegmentAgent:
         return sealed
 
     def _update_threshold(self, state: SegmenterState, rms: float) -> float:
-        """Track the room's background level and derive the speech threshold.
+        """Put the speech threshold between the room's floor and its speech.
 
-        A fixed absolute RMS cannot survive contact with a real microphone.
-        Measured over an hour of lecture audio captured through the built-in
-        mic: at the configured 300 a qualifying 700ms silence gap occurred once
-        every 36 seconds -- longer than the 30s segment cap -- so segments
-        stopped closing on silence entirely and ran to the ceiling, p50 29.0s
-        against a 6s preferred length. Room tone, macOS input gain and speaker
-        distance all move the absolute level; only the ratio is stable.
+        A fixed absolute RMS cannot work across rooms, microphones and playback
+        volume. Two real recordings make that concrete: one had frame RMS p5=93
+        and p50=1706, the other p5=77 and p50=393 -- the same threshold that
+        segmented the first correctly produced ZERO segments on the second,
+        because the whole signal sat near it.
 
-        The floor falls quickly and rises slowly, so it follows the room rather
-        than the speech sitting on top of it, and never drops below
-        `noise_floor_min_rms` (silence would otherwise drive the threshold to
-        zero and make every frame voiced). The result is clamped from below by
-        `threshold_rms`, which is why that setting still means something.
+        So the threshold is the geometric mean of a windowed floor and a
+        windowed peak -- the midpoint in dB between silence and speech -- which
+        depends on the ratio between them rather than on absolute level.
+
+        Both statistics are the minimum and maximum of samples actually
+        observed in the last 5-10 seconds, which is the property that matters
+        most here. The previous version of this method used an exponential
+        upward leak with no bound; over 54 seconds of continuous speech it
+        drove the threshold from 300 to 1743, above the speaker's own level,
+        and segmentation stopped dead after the first sentence. A statistic
+        that is a min and a max of real samples cannot do that: it is bounded
+        by the signal by construction.
         """
         config = self.config
-        floor = state.noise_floor_rms or config.noise_floor_min_rms
-        if rms < floor:
-            # Falls fast: one quiet frame is strong evidence about the room,
-            # and it undoes roughly 350 frames of the upward leak below. This
-            # asymmetry is what makes the estimate track the background
-            # MINIMUM rather than the average, which is what a noise floor is.
-            floor += _NOISE_FLOOR_FALL * (rms - floor)
-        else:
-            # Leaks up unconditionally, including through speech. Learning only
-            # from frames already judged quiet cannot work: a hall whose
-            # background sits above the starting threshold would have every
-            # frame classified as speech, the floor would never move, and no
-            # segment would ever close. The leak is slow enough that it takes
-            # ~60s of unbroken loud audio to matter, and any pause resets it.
-            floor *= 1.0 + _NOISE_FLOOR_RISE
-        state.noise_floor_rms = max(floor, config.noise_floor_min_rms)
-        return max(
-            state.noise_floor_rms * config.noise_floor_multiplier,
-            config.threshold_rms,
+        if state.level_block_index >= _LEVEL_BLOCK_FRAMES:
+            state.level_previous_min = state.level_block_min
+            state.level_previous_max = state.level_block_max
+            state.level_block_min = 0.0
+            state.level_block_max = 0.0
+            state.level_block_index = 0
+        state.level_block_index += 1
+        state.level_block_min = (
+            rms if state.level_block_min <= 0 else min(state.level_block_min, rms)
         )
+        state.level_block_max = max(state.level_block_max, rms)
+
+        candidates = [v for v in (state.level_block_min, state.level_previous_min) if v > 0]
+        floor = max(min(candidates) if candidates else rms, config.noise_floor_min_rms)
+        peak = max(state.level_block_max, state.level_previous_max)
+        state.noise_floor_rms = floor
+        if peak < floor * _MIN_DYNAMIC_RANGE:
+            # The window shows no gap between quiet and loud -- a session that
+            # began mid-sentence, or a speaker who has not paused yet. There is
+            # no evidence on which to place a boundary, so treat the audio as
+            # speech. Over-capturing costs a segment that runs to its maximum
+            # length; under-capturing loses the words entirely, and that is the
+            # failure that actually happened.
+            return floor
+        return max((floor * peak) ** 0.5, config.noise_floor_min_rms)
 
     def _process_frame(self, frame: bytes, row: dict) -> SealedSegment | None:
         state = self._state

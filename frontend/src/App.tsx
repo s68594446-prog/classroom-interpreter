@@ -262,7 +262,7 @@ export function App() {
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        setError(body.detail ?? "Start Class 失败");
+        setError(body.detail ?? "开始上课失败");
         return;
       }
       const view = await response.json();
@@ -414,7 +414,7 @@ export function App() {
           />
           <div className="session-status">
             <button type="button" onClick={startClass} disabled={starting}>
-              {starting ? "Starting…" : "Start Class"}
+              {starting ? "正在启动…" : "开始上课"}
             </button>
           </div>
           {error && <p className="error-text">{error}</p>}
@@ -468,7 +468,7 @@ export function App() {
             {paused && autoPausedAfter !== null && (
               <p className="auto-pause-banner" role="status">
                 已自动暂停：检测到 {Math.round(autoPausedAfter)} 秒无人说话。
-                已录制的内容都在，按 Resume 继续。
+                已录制的内容都在，按「继续」恢复。
               </p>
             )}
             <div className="controls">
@@ -477,21 +477,21 @@ export function App() {
                 onClick={() => control("pause")}
                 disabled={!recording}
               >
-                Pause
+                暂停
               </button>
               <button
                 type="button"
                 onClick={() => control("resume")}
                 disabled={!paused}
               >
-                Resume
+                继续
               </button>
               <button
                 type="button"
                 onClick={() => control("end")}
                 disabled={!recording && !paused}
               >
-                {endBusy ? "Draining…" : "End Class"}
+                {endBusy ? "正在收尾…" : "结束上课"}
               </button>
             </div>
             {progress && (
