@@ -111,14 +111,57 @@ class Database:
                         f"PRAGMA table_info({table})").fetchall()}
                     if column in columns:
                         script = "SELECT 1;"
-                wrapped = (
-                    "BEGIN IMMEDIATE;\n"
-                    f"{script}\n"
-                    "INSERT INTO schema_migrations(version, name, applied_at) "
-                    f"VALUES ({version}, '{migration_path.name}', {applied_at_expression});\n"
-                    "COMMIT;"
+                # A table rebuild must run with foreign keys OFF. Every script is
+                # wrapped in a transaction below, and SQLite silently ignores
+                # `PRAGMA foreign_keys` inside one -- so a `PRAGMA foreign_keys =
+                # OFF` written in the migration itself does nothing at all, and
+                # `DROP TABLE` then performs an implicit DELETE that cascades.
+                #
+                # That shipped. Migration 010 rebuilt `segments` and, on a copy
+                # of a real database, deleted every asr_result, translation,
+                # staged translation, context snapshot and processing attempt
+                # while leaving the segments themselves in place -- and
+                # `foreign_key_check` came back clean, because the children were
+                # gone rather than orphaned. No test migrated a database that
+                # already held data, so nothing noticed.
+                #
+                # The pragma is only honoured here, on the connection, BEFORE the
+                # transaction opens. A drop without the directive is refused
+                # outright rather than trusted.
+                fk_off = any(
+                    line.strip() == "-- requires-foreign-keys-off"
+                    for line in script.splitlines()
                 )
-                connection.executescript(wrapped)
+                drops_table = "DROP TABLE" in script.upper()
+                if drops_table and not fk_off:
+                    raise ValueError(
+                        f"{migration_path.name} drops a table without declaring "
+                        "'-- requires-foreign-keys-off'; with foreign keys on, the "
+                        "drop cascades and deletes every dependent row"
+                    )
+                if fk_off:
+                    connection.execute("PRAGMA foreign_keys = OFF")
+                    enabled = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+                    if enabled:
+                        raise RuntimeError("could not disable foreign keys for migration")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{script}\n")
+                if fk_off:
+                    # Still inside the transaction: a rebuild that broke a
+                    # reference rolls back instead of committing it.
+                    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise RuntimeError(
+                            f"{migration_path.name} left {len(violations)} "
+                            "foreign-key violations"
+                        )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) "
+                    f"VALUES (?, ?, {applied_at_expression})",
+                    (version, migration_path.name),
+                )
+                connection.commit()
+                if fk_off:
+                    connection.execute("PRAGMA foreign_keys = ON")
             except Exception:
                 connection.rollback()
                 raise

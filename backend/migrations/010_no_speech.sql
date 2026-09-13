@@ -17,10 +17,15 @@
 -- separates the two, and it is terminal, excluded from the summary transcript
 -- (which reads DONE only), and counted as neither pending nor failed.
 --
--- SQLite cannot alter a CHECK constraint, so the table is rebuilt. Foreign
--- keys are disabled for the swap only; the child rows are unchanged and the
--- keys are re-enabled and verified immediately afterwards.
-PRAGMA foreign_keys = OFF;
+-- SQLite cannot alter a CHECK constraint, so the table is rebuilt.
+--
+-- The first version of this file said "PRAGMA foreign_keys = OFF" here. That
+-- line did nothing: the migration runner wraps every script in a transaction,
+-- where SQLite ignores the pragma, so DROP TABLE cascaded and deleted every
+-- transcript, translation and attempt record while keeping the segments. The
+-- directive below is honoured by the runner before the transaction opens, and
+-- the runner checks foreign keys before it commits.
+-- requires-foreign-keys-off
 
 CREATE TABLE segments_rebuilt (
     id TEXT PRIMARY KEY,
@@ -67,4 +72,3 @@ CREATE INDEX idx_segments_claim
 CREATE INDEX idx_segments_session_state
     ON segments(session_id, state, sequence);
 
-PRAGMA foreign_keys = ON;
