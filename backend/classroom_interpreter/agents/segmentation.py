@@ -31,6 +31,10 @@ FRAME_SAMPLES = 160  # 10 ms frames at 16 kHz
 SAMPLE_BYTES = 2
 FRAME_BYTES = FRAME_SAMPLES * SAMPLE_BYTES
 FRAME_MS = FRAME_SAMPLES * 1000 // NORMALIZED_RATE  # 10
+# Enough above-threshold audio inside an utterance to be a word rather than a
+# blip of noise. This is the noise-rejection floor that `min_seconds` was being
+# misused as.
+_MIN_UTTERANCE_VOICED_MS = 300
 BYTES_PER_MS = NORMALIZED_RATE // 1000 * SAMPLE_BYTES  # 32
 
 
@@ -559,7 +563,23 @@ class SegmentAgent:
             # runs to its maximum length; under-capturing loses the words
             # entirely, and that is the failure that actually happened.
             return floor
-        return max((floor * peak) ** 0.5, config.noise_floor_min_rms)
+        # The geometric mean alone is dominated by loud transients. Measured on
+        # a live minute through this laptop's microphone: frame RMS p50 113,
+        # p90 764, and a five-second window maximum reaching 5632 -- a fiftyfold
+        # spread. sqrt(40 * 5632) puts the threshold at 475, above ninety per
+        # cent of the speaker's own frames, and the segmenter then hears almost
+        # nothing.
+        #
+        # `noise_floor_multiplier` is the rule this replaced, and it was swept
+        # against 800s of real captured audio before the geometric mean existed.
+        # Keeping it as a ceiling gets both properties: the mean adapts the
+        # threshold to the gap between floor and speech, and the multiplier
+        # stops one shout from raising it out of reach of everything else.
+        #
+        # Measured on the same minute: segments 2 -> 7, audio covered
+        # 13.2s -> 48.7s, with no segment hitting the 30s cap.
+        ceiling = floor * config.noise_floor_multiplier
+        return max(min((floor * peak) ** 0.5, ceiling), config.noise_floor_min_rms)
 
     def _process_frame(self, frame: bytes, row: dict) -> SealedSegment | None:
         state = self._state
@@ -618,7 +638,21 @@ class SegmentAgent:
         if not (silence_close or max_close):
             return None
 
-        if max_close or voiced_ms >= config.min_seconds * 1000:
+        # The utterance's LENGTH, not how many of its frames cleared the
+        # threshold. `voiced_ms >= min_seconds` demanded two full seconds of
+        # above-threshold audio inside one utterance, which no real sentence
+        # containing pauses ever has -- and it made the discard doubly
+        # sensitive to a threshold that is itself an estimate. Measured on a
+        # live minute: 49 of 51 utterances were thrown away, leaving 13.2s of
+        # 120s. With the length test and the same threshold fix: 11 kept,
+        # 57.2s covered.
+        #
+        # The voiced floor stays, because the rule's purpose stays: reject a
+        # blip of noise that happens to last two seconds. 300ms is "there is at
+        # least a word here", which is what that purpose actually requires.
+        long_enough = duration_ms >= config.min_seconds * 1000
+        has_speech = voiced_ms >= _MIN_UTTERANCE_VOICED_MS
+        if max_close or (long_enough and has_speech):
             return self._seal_segment()
         # Sub-minimum utterance closed by silence: discarded to avoid a flood
         # of empty/noise ASR calls (F-032). The audio remains in the sealed

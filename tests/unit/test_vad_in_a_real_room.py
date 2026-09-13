@@ -416,3 +416,132 @@ def test_the_empty_room_rule_does_not_deafen_a_quiet_speaker(database, tmp_path)
     assert sum(voiced) / len(voiced) > 0.8, (
         "a quiet speaker was cut to pieces by the empty-room rule"
     )
+
+
+# ------------------------------------------- the live minute that found these
+
+
+def test_one_shout_must_not_deafen_the_rest_of_the_class(database, tmp_path):
+    """The geometric mean is dominated by the window's loudest frame.
+
+    Measured through this laptop's microphone on a live minute of a played
+    lecture: frame RMS p50 113, p90 764, and a five-second window maximum
+    reaching 5632 -- a fiftyfold spread. `sqrt(40 * 5632)` puts the threshold
+    at 475, above ninety per cent of the speaker's own frames, and the
+    segmenter then hears almost nothing. It produced 2 segments in 120
+    seconds.
+
+    `noise_floor_multiplier` is the rule the geometric mean replaced, and it
+    was swept against 800s of real audio. Kept as a ceiling, it stops one loud
+    moment from raising the threshold out of reach of everything else.
+
+    Mutation that turns this red: drop the `min(..., ceiling)` in
+    `_update_threshold`.
+    """
+    agent = make_agent(database, tmp_path, h.make_session(database))
+    rng = np.random.default_rng(20260913)
+    frames = int(30.0 * 1000 / FRAME_MS)
+    levels = rng.normal(250, 70, frames).clip(45, 700)
+    # One loud moment per five seconds: a cough, a chair, a raised voice.
+    for index in range(0, frames, 500):
+        levels[index] = 5632.0
+    voiced = classify(agent, list(levels))
+
+    assert sum(voiced) / len(voiced) > 0.6, (
+        f"only {sum(voiced) / len(voiced):.0%} of ordinary speech stayed "
+        "audible after a loud transient entered the window"
+    )
+
+
+def test_a_sentence_with_pauses_in_it_is_not_thrown_away(database, tmp_path):
+    """The sub-minimum discard measured *voiced frames*, not the utterance.
+
+    `voiced_ms >= min_seconds` demanded two full seconds of above-threshold
+    audio inside one utterance. No real sentence containing pauses has that,
+    and the test was doubly sensitive to a threshold that is itself an
+    estimate. Measured on the same live minute: 49 of 51 utterances discarded,
+    13.2 seconds of audio kept out of 120.
+
+    Mutation that turns this red: go back to `voiced_ms >= min_seconds *
+    1000` as the keep condition.
+    """
+    import helpers_phase3 as hp
+    from classroom_interpreter.agents.segmentation import SegmentAgent
+
+    session_id = h.make_session(database)
+    # Three seconds of speech broken by ordinary pauses: well over the two
+    # second minimum length, well under two seconds of continuous voicing.
+    envelope = [("silence", 0.6)]
+    for _ in range(6):
+        envelope += [("speech", 0.25), ("silence", 0.25)]
+    envelope += [("silence", 1.5)]
+    hp.write_chunks(
+        database, tmp_path / "cap" / session_id, session_id,
+        hp.envelope_blocks(envelope), chunk_seconds=1,
+    )
+    agent = SegmentAgent(
+        database, tmp_path / "sess" / session_id, session_id, SegmenterConfig()
+    )
+    agent.process_available_chunks()
+    agent.seal_tail()
+
+    with database.connect() as connection:
+        kept = connection.execute(
+            "SELECT COUNT(*) FROM segments WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        discarded = connection.execute(
+            "SELECT discarded_utterances FROM pipeline_cursors WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+
+    assert kept >= 1, (
+        f"a three-second sentence with pauses was discarded "
+        f"({discarded} utterances thrown away, none kept)"
+    )
+
+
+def test_a_long_utterance_with_almost_no_speech_in_it_is_still_discarded(
+    database, tmp_path
+):
+    """The discard rule's purpose survives the fix: a stretch of near-silence
+    that stays open long enough must not become a paid transcription.
+
+    With the shipped configuration this cannot happen -- reaching two seconds
+    requires at least two 200ms bursts of voicing to keep resetting the silence
+    run, which is already more than the 300ms floor. So the guard is exercised
+    with a configuration that makes it reachable (a 10ms onset and a long
+    silence gap), because a guard nobody can trigger is a guard nobody has
+    tested. That is exactly how the rule it replaces went wrong.
+
+    Mutation that turns this red: drop the `has_speech` half of the keep
+    condition.
+    """
+    import helpers_phase3 as hp
+    from classroom_interpreter.agents.segmentation import SegmentAgent
+
+    session_id = h.make_session(database)
+    hp.write_chunks(
+        database, tmp_path / "cap" / session_id, session_id,
+        hp.envelope_blocks(
+            [("silence", 0.5), ("speech", 0.02), ("silence", 3.0)]
+        ),
+        chunk_seconds=1,
+    )
+    agent = SegmentAgent(
+        database, tmp_path / "sess" / session_id, session_id,
+        SegmenterConfig(voiced_onset_milliseconds=10, silence_milliseconds=2000),
+    )
+    agent.process_available_chunks()
+    agent.seal_tail()
+
+    with database.connect() as connection:
+        kept = connection.execute(
+            "SELECT COUNT(*) FROM segments WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        discarded = connection.execute(
+            "SELECT discarded_utterances FROM pipeline_cursors WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+
+    assert kept == 0, "20ms of sound became a transcription request"
+    assert discarded >= 1, "the utterance was never opened, so nothing was judged"
