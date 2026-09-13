@@ -25,6 +25,7 @@ export type WebSocketEventKind =
   // replay cursor.
   | "subtitle.partial"
   | "subtitle.committed"
+  | "subtitle.gap"
   | "health.snapshot";
 
 export interface WebSocketEvent {
@@ -88,6 +89,10 @@ export interface Progress {
 
 export interface CommittedItem {
   sequence: number;
+  // Set when this position in the transcript has no sentence: the audio was
+  // silent, or it could not be transcribed. Marked so the reader can see that
+  // something is missing rather than reading across the join.
+  gap_reason?: string;
   english_text: string;
   chinese_text: string;
   start_ms: number;

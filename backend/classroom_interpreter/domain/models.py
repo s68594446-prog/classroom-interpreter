@@ -60,6 +60,10 @@ class WebSocketEventKind(StrEnum):
     # segment seals (D-046).
     SUBTITLE_PARTIAL = "subtitle.partial"
     SUBTITLE_COMMITTED = "subtitle.committed"
+    # A sentence that will never have a translation: silent, or terminally
+    # failed. Published so the reader sees a marked gap instead of a seamless
+    # join between two sentences that were not spoken next to each other.
+    SUBTITLE_GAP = "subtitle.gap"
     HEALTH = "health.snapshot"
 
 

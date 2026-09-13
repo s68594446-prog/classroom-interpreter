@@ -211,6 +211,18 @@ export function App() {
             sequence: Number(payload.sequence),
             english_text: String(payload.english_text ?? ""),
           });
+        } else if (event.kind === "subtitle.gap") {
+          // A sentence that will never have a translation. Marked rather than
+          // skipped: joining the two sentences either side of it would read as
+          // continuous speech when a sentence is missing.
+          applyCommitted({
+            sequence: Number(payload.sequence),
+            english_text: "",
+            chinese_text: "",
+            start_ms: 0,
+            end_ms: 0,
+            gap_reason: String(payload.reason ?? ""),
+          });
         } else if (event.kind === "subtitle.committed") {
           setPartial({ english: "", chinese: "", chineseFor: "" });
           applyCommitted({
@@ -874,17 +886,33 @@ export function App() {
               </p>
             )}
 
-            {committed.map((item) => (
-              <article className="caption" key={item.sequence}>
-                <span className="caption-seq">{item.sequence + 1}</span>
-                <div className="caption-body">
-                  {/* Chinese first and largest: it is what the reader is here
-                      for. English stays beneath as the checkable source. */}
-                  <p className="caption-zh">{item.chinese_text}</p>
-                  <p className="caption-en">{item.english_text}</p>
-                </div>
-              </article>
-            ))}
+            {committed.map((item) =>
+              item.gap_reason ? (
+                /* A sentence that will never have a translation. Marked, not
+                   skipped: joining the sentences either side of it would read
+                   as continuous speech with one silently removed. */
+                <article className="caption caption-gap" key={item.sequence}>
+                  <span className="caption-seq">{item.sequence + 1}</span>
+                  <div className="caption-body">
+                    <p className="caption-gap-text">
+                      {item.gap_reason === "NO_SPEECH"
+                        ? "（这一段没有说话）"
+                        : "（这一段没能识别出来，音频仍已保存）"}
+                    </p>
+                  </div>
+                </article>
+              ) : (
+                <article className="caption" key={item.sequence}>
+                  <span className="caption-seq">{item.sequence + 1}</span>
+                  <div className="caption-body">
+                    {/* Chinese first and largest: it is what the reader is here
+                        for. English stays beneath as the checkable source. */}
+                    <p className="caption-zh">{item.chinese_text}</p>
+                    <p className="caption-en">{item.english_text}</p>
+                  </div>
+                </article>
+              ),
+            )}
 
             {/* English lands ~2.3s before Chinese. Showing it immediately, in
                 the same stream, is the difference between a ~6s and a ~3.6s

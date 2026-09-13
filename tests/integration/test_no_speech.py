@@ -195,7 +195,7 @@ def test_several_adjacent_silent_segments_are_all_skipped(tmp_path):
         )
         connection.commit()
 
-    repository.release_next_translation_result(session_id)
+    skipped = repository.advance_past_unreleasable(session_id)
 
     with database.connect() as connection:
         cursor = connection.execute(
@@ -204,4 +204,7 @@ def test_several_adjacent_silent_segments_are_all_skipped(tmp_path):
         ).fetchone()[0]
     assert cursor == len(sequences), (
         f"cursor stopped at {cursor} with {len(sequences)} silent segments"
+    )
+    assert [gap["sequence"] for gap in skipped] == sequences, (
+        "a skipped sentence must be reported, not spliced out silently"
     )

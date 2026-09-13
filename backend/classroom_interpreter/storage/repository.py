@@ -1089,7 +1089,6 @@ class SessionRepository:
         `session_id` confines the release to one class."""
         now = _now_iso()
         with self.database.transaction() as connection:
-            self._skip_silent_segments(connection, session_id, now)
             row = connection.execute(
                 """
                 SELECT staged.*, asr.english_text, seg.state AS segment_state
@@ -1164,40 +1163,81 @@ class SessionRepository:
                 "chinese_text": row["chinese_text"],
             }
 
-    @staticmethod
-    def _skip_silent_segments(connection, session_id: str | None, now: str) -> int:
-        """Move the ordered release cursor past segments that hold no speech.
+    # A segment in one of these states will never stage a translation: it is
+    # terminal and produced nothing to release. The ordered cursor must step
+    # over them or it parks on the first one forever.
+    UNRELEASABLE_STATES = ("NO_SPEECH", "ASR_FAILED", "TRANSLATION_FAILED")
 
-        Translations are released strictly in sequence, at the cursor. A
-        NO_SPEECH segment never produces a staged translation, so the cursor
-        stops at the first one and every later sentence is stuck behind it
-        forever -- the class drains to a halt and can never be summarised.
-        Reproduced exactly that way: one silent segment, the next stuck in
-        TRANSLATION_PROCESSING, the session frozen in FINALIZING.
+    def advance_past_unreleasable(self, session_id: str | None = None) -> list[dict]:
+        """Step the release cursor over segments that can never stage a result.
 
-        Several silent segments can be adjacent, so this advances until the
-        cursor rests on one that is not silent.
+        Returns what was stepped over, so the caller can say so on screen. A
+        skipped sentence must be visible: splicing the transcript silently
+        would make two sentences that were not spoken next to each other read
+        as if they were.
         """
-        skipped = 0
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            return self._skip_unreleasable_segments(connection, session_id, now)
+
+    @staticmethod
+    def _skip_unreleasable_segments(
+        connection, session_id: str | None, now: str
+    ) -> list[dict]:
+        """Move the ordered release cursor past segments that can never stage.
+
+        Translations are released strictly in sequence, at a per-session
+        cursor. A segment that is terminal without a result -- silent, or
+        failed -- never stages one, so the cursor stops on it and every later
+        sentence is stuck behind it forever.
+
+        Observed live, in the owner's own session: sequence 2 failed ASR, and
+        sequences 4 and 5 sat staged and fully translated in the database, paid
+        for, and could never reach the screen. From the first failure onward
+        the class simply stopped producing Chinese, with nothing anywhere
+        saying why.
+
+        Skipping does not weaken D-006. A failed segment is still counted in
+        `failed_segments`, the drain still refuses to summarise the class, and
+        `verify_drained` still rejects it. What changes is that one failure no
+        longer takes the rest of the lecture's captions down with it.
+
+        Terminal segments come in runs, so this advances until the cursor rests
+        on one that could still produce a result.
+        """
+        placeholders = ", ".join("?" for _ in SessionRepository.UNRELEASABLE_STATES)
+        skipped: list[dict] = []
         while True:
-            updated = connection.execute(
-                """
-                UPDATE sessions
-                SET next_translation_sequence = next_translation_sequence + 1,
-                    updated_at = :now, version = version + 1
-                WHERE (:session IS NULL OR id = :session)
-                  AND EXISTS (
-                      SELECT 1 FROM segments g
-                      WHERE g.session_id = sessions.id
-                        AND g.sequence = sessions.next_translation_sequence
-                        AND g.state = 'NO_SPEECH'
-                  )
+            rows = connection.execute(
+                f"""
+                SELECT g.session_id, g.sequence, g.state
+                FROM sessions s
+                JOIN segments g ON g.session_id = s.id
+                               AND g.sequence = s.next_translation_sequence
+                WHERE (? IS NULL OR s.id = ?)
+                  AND g.state IN ({placeholders})
                 """,
-                {"now": now, "session": session_id},
-            )
-            if not updated.rowcount:
+                (session_id, session_id, *SessionRepository.UNRELEASABLE_STATES),
+            ).fetchall()
+            if not rows:
                 return skipped
-            skipped += updated.rowcount
+            for row in rows:
+                connection.execute(
+                    """
+                    UPDATE sessions
+                    SET next_translation_sequence = next_translation_sequence + 1,
+                        updated_at = ?, version = version + 1
+                    WHERE id = ? AND next_translation_sequence = ?
+                    """,
+                    (now, row["session_id"], row["sequence"]),
+                )
+                skipped.append(
+                    {
+                        "session_id": row["session_id"],
+                        "sequence": row["sequence"],
+                        "state": row["state"],
+                    }
+                )
 
     def finish_translation_attempt(
         self,

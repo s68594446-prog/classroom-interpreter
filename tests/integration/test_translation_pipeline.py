@@ -393,8 +393,26 @@ def test_duplicate_translation_commit_is_idempotent(database, tmp_path):
     assert outcome is CommitOutcome.ALREADY_COMMITTED
 
 
-def test_failed_translation_blocks_release_but_not_later_processing(database, tmp_path):
-    """A terminal failure blocks release, while later work is durably staged."""
+def test_a_terminal_failure_does_not_block_the_sentences_after_it(database, tmp_path):
+    """This test asserted the opposite until a live session showed the cost.
+
+    The old contract was that a terminal failure blocks release: the cursor
+    stops, later segments stay staged, and nothing after the failure is ever
+    shown. The reasoning was sound -- the reader must not be handed sentence 4
+    without sentence 3, because the transcript would read as continuous when a
+    sentence is missing.
+
+    What it means in practice is that the first failure ends the captions for
+    the rest of the lecture. Observed in the owner's own session: sequence 2
+    failed ASR, sequences 4 and 5 sat staged and fully translated in the
+    database, paid for, and could never reach the screen. Nothing said why.
+
+    The integrity concern is real, so it is answered directly rather than by
+    stalling: the cursor steps over what can never produce a result and a
+    `subtitle.gap` event is published for it, so the gap is marked on screen
+    instead of being spliced out. D-006 is untouched -- the segment still
+    counts as failed, the class still cannot be summarised as complete.
+    """
     calls = {"n": 0}
 
     class FailFirst(MockTranslationProvider):
@@ -416,21 +434,64 @@ def test_failed_translation_blocks_release_but_not_later_processing(database, tm
     rows = segment_rows(database, session_id)
     assert rows[0]["state"] == "DONE"
     assert rows[1]["state"] == "TRANSLATION_FAILED"
-    assert rows[2]["state"] == "TRANSLATION_PROCESSING"
-    assert rows[3]["state"] == "TRANSLATION_PROCESSING"
+    assert rows[2]["state"] == "DONE", "the sentence after a failure never arrived"
+    assert rows[3]["state"] == "DONE"
     with database.connect() as connection:
         cursor = connection.execute(
             "SELECT next_translation_sequence, last_error_category FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
-    assert cursor["next_translation_sequence"] == 1
+    assert cursor["next_translation_sequence"] == 4
     assert cursor["last_error_category"] == "AUTH"
     with database.connect() as connection:
         staged = connection.execute(
-            "SELECT segment_sequence FROM translation_staged_results WHERE session_id = ? ORDER BY segment_sequence",
+            "SELECT segment_sequence FROM translation_staged_results WHERE session_id = ?",
             (session_id,),
         ).fetchall()
-    assert [row["segment_sequence"] for row in staged] == [2, 3]
+    assert staged == [], "staged results were left stranded behind the failure"
+
+
+def test_a_skipped_sentence_is_announced_not_spliced_out(database, tmp_path):
+    """Stepping over a failure silently would join two sentences that were not
+    spoken next to each other, and the reader could not tell.
+
+    Mutation that turns this red: advance the cursor without publishing
+    `subtitle.gap`.
+    """
+    class FailOne(MockTranslationProvider):
+        async def translate(self, request):
+            if request.sequence == 1:
+                raise ProviderFailure(
+                    ProviderError(category=ProviderErrorCategory.AUTH,
+                                  retryable=False, http_status=401,
+                                  safe_message="provider rejected credentials")
+                )
+            return await super().translate(request)
+
+    events = []
+    session_id, translation = make_session_with_done_asr(
+        database, tmp_path, drain=False
+    )
+    translation.provider = FailOne()
+    sequencer = TranslationSequencer(
+        database,
+        event_sink=lambda kind, payload, sid=None: events.append((kind, payload)),
+    )
+    steps = 0
+    while steps < 200:
+        worked = asyncio.run(translation.step())
+        released = False
+        while asyncio.run(sequencer.step()):
+            released = True
+        if not worked and not released:
+            break
+        steps += 1
+
+    gaps = [payload for kind, payload in events if kind == "subtitle.gap"]
+    assert [gap["sequence"] for gap in gaps] == [1], (
+        f"the missing sentence was not announced; events were {events}"
+    )
+    assert gaps[0]["reason"] == "TRANSLATION_FAILED"
 
 
 def test_translation_retry_matrix_then_success(database, tmp_path):

@@ -364,9 +364,23 @@ class TranslationSequencer:
         self._repository = SessionRepository(self.database)
 
     async def step(self) -> bool:
+        # Step over anything that can never produce a result first, and say so.
+        # The cursor used to park on the first such segment forever: observed
+        # live, sequence 2 failed ASR and sequences 4 and 5 sat fully
+        # translated in the database, paid for, unable to reach the screen --
+        # and from that point the class produced no more Chinese at all.
+        worked = False
+        for gap in self._repository.advance_past_unreleasable(self.session_id):
+            worked = True
+            if self.event_sink is not None:
+                self.event_sink(
+                    "subtitle.gap",
+                    {"sequence": gap["sequence"], "reason": gap["state"]},
+                    gap["session_id"],
+                )
         released = self._repository.release_next_translation_result(self.session_id)
         if released is None:
-            return False
+            return worked
         if self.event_sink is not None:
             # Published under the session the released row belongs to.
             self.event_sink(

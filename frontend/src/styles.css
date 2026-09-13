@@ -658,3 +658,15 @@ button {
   content: "· ";
   opacity: 0.6;
 }
+
+/* A position in the transcript with no sentence. Visible on purpose: the
+   alternative is two sentences that were not spoken next to each other reading
+   as if they were. */
+.caption-gap .caption-body {
+  opacity: 0.55;
+}
+.caption-gap-text {
+  margin: 0;
+  font-style: italic;
+  font-size: 0.9rem;
+}
