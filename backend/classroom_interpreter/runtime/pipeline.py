@@ -107,6 +107,12 @@ class SessionOrchestrator:
         # the UI can distinguish it from a pause the user pressed.
         self.auto_paused_at_silence_seconds: float | None = None
         self.worker_faults: dict[str, dict[str, int | str]] = {}
+        # A nudge, not a queue. Durable rows remain the only queue (D-025);
+        # this just stops a worker sleeping out its poll interval when a
+        # segment has just been sealed. If the nudge is ever lost the poll
+        # still finds the work, so nothing depends on it for correctness --
+        # only for the ~0.3s it removes from the front of every caption.
+        self._work_ready = asyncio.Event()
         self._caption_gate = CaptionOrderGate(self._publish_caption)
         self.health_store = HealthMetricsStore(
             settings.health_database_path,
@@ -169,6 +175,7 @@ class SessionOrchestrator:
         # behind the sequence numbers of the previous one.
         self._caption_gate = CaptionOrderGate(self._publish_caption)
         self._stop.clear()
+        self._work_ready.clear()
         self._spawn_workers()
         self.publisher.publish(
             session_id,
@@ -301,7 +308,10 @@ class SessionOrchestrator:
     async def _segmenter_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self._segmenter.process_available_chunks()
+                sealed = self._segmenter.process_available_chunks()
+                if sealed:
+                    # Work exists now; do not make it wait for a poll timer.
+                    self._work_ready.set()
                 # A caption held behind a gap that never closes must still
                 # reach the screen; nothing else would release it if the
                 # missing segment is the last one to fail.
@@ -554,10 +564,7 @@ class SessionOrchestrator:
                 worked = False
             if worked:
                 continue
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=0.3)
-            except asyncio.TimeoutError:
-                continue
+            await self._idle(0.3)
 
     async def _translation_loop(self, worker=None) -> None:
         worker = worker or self._translation_worker
@@ -569,10 +576,28 @@ class SessionOrchestrator:
                 worked = False
             if worked:
                 continue
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=0.3)
-            except asyncio.TimeoutError:
-                continue
+            await self._idle(0.3)
+
+    async def _idle(self, seconds: float) -> None:
+        """Sleep until there is work, the poll interval elapses, or we stop.
+
+        The poll interval is the backstop, not the mechanism: a segment sealed
+        just after a worker went to sleep used to wait out the full interval
+        before anyone looked at it, and the ASR and translation legs each paid
+        that separately in front of every caption.
+        """
+        waiters = [
+            asyncio.create_task(self._stop.wait()),
+            asyncio.create_task(self._work_ready.wait()),
+        ]
+        try:
+            done, pending = await asyncio.wait(
+                waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in waiters:
+                task.cancel()
+        self._work_ready.clear()
 
     async def _sequencer_loop(self) -> None:
         while not self._stop.is_set():
