@@ -21,8 +21,16 @@ class HealthMetricsStore:
 
     path: Path
     max_buffered: int = 4096
+    # Nothing ever deleted from `health_metric_samples`. Two samples a second
+    # while recording is 21,600 rows for one three-hour class, kept forever, in
+    # a table no production code reads back -- it exists to be looked at after
+    # something goes wrong, which makes only the recent past useful. This keeps
+    # roughly the last two days of continuous recording and drops the rest.
+    max_samples: int = 200_000
+    prune_every: int = 600
     _buffer: deque[tuple] = field(init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _flushes_since_prune: int = 0
     dropped_samples: int = 0
     last_flush_error: str | None = None
 
@@ -151,7 +159,33 @@ class HealthMetricsStore:
             self.last_flush_error = type(exc).__name__
             return 0
         self.last_flush_error = None
+        self._flushes_since_prune += 1
+        if self._flushes_since_prune >= self.prune_every:
+            self._flushes_since_prune = 0
+            self.prune()
         return len(batch)
+
+    def prune(self) -> int:
+        """Drop the oldest samples past `max_samples`. Best effort.
+
+        Deleting by id keeps this a range delete on the primary key rather than
+        a scan, and a failure here is a file that grows, not a broken flush --
+        so it must never turn a successful flush into an error.
+        """
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM health_metric_samples
+                    WHERE id <= (
+                        SELECT MAX(id) - ? FROM health_metric_samples
+                    )
+                    """,
+                    (self.max_samples,),
+                )
+                return cursor.rowcount if cursor.rowcount > 0 else 0
+        except sqlite3.Error:
+            return 0
 
 
 @dataclass(slots=True)

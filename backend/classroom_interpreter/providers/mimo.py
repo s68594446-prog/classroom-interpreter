@@ -670,7 +670,12 @@ class MimoTranslationProvider:
             if response.status != 200:
                 return ""
             text, _ = parse_asr_response(response.body)
-            return (text or "").strip()
+            # The same interim stripping the English partial gets. It was
+            # applied to `transcribe_bytes` only, so a leading `think` remnant
+            # still reached the Chinese line -- where it is less ambiguous, not
+            # more: a bare English "think" at the head of text that should be
+            # Chinese is scaffolding, not a lecturer's word.
+            return strip_interim_scaffolding(text or "")
         except Exception:
             # Display only. A failed partial must never surface as a session
             # error or disturb the committed pipeline.

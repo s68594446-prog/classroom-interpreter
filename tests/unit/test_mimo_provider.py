@@ -521,3 +521,48 @@ def test_a_client_from_a_dead_event_loop_is_replaced(monkeypatch):
     asyncio.run(once())  # a different loop
 
     assert len(built) == 2
+
+
+def test_the_chinese_partial_gets_the_same_interim_stripping_as_the_english():
+    """`strip_interim_scaffolding` was applied to `transcribe_bytes` only, so a
+    leading `think` remnant still reached the Chinese interim line.
+
+    The ambiguity that keeps this out of the durable record does not apply
+    here twice over: the line is interim, and a bare English "think" at the
+    head of text that should be Chinese is scaffolding, not a lecturer's word.
+
+    Mutation that turns this red: return the parsed text directly from
+    `translate_text`, without `strip_interim_scaffolding`.
+    """
+    import asyncio
+    import json
+
+    from classroom_interpreter.providers.mimo import (
+        MimoTranslationProvider,
+        ProviderHttpResponse,
+    )
+
+    async def post(url, headers, payload):
+        return ProviderHttpResponse(
+            status=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "id": "r1",
+                    "choices": [
+                        {
+                            "message": {"content": "think 风险价值衡量最坏损失"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+        )
+
+    provider = MimoTranslationProvider(
+        api_key="k", base_url="https://x/v1", model="mimo-v2.5", post=post
+    )
+
+    assert asyncio.run(provider.translate_text("value at risk")) == (
+        "风险价值衡量最坏损失"
+    )

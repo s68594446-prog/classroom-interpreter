@@ -202,3 +202,34 @@ def test_health_monitor_flushes_buffer_on_shutdown(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM health_heartbeats"
         ).fetchone()[0] >= 1
+
+
+def test_the_metrics_table_does_not_grow_forever(tmp_path):
+    """Two samples a second while recording is 21,600 rows for one three-hour
+    class, and nothing ever deleted any of them. Production code never reads
+    this table back -- it exists to be looked at after something goes wrong,
+    which makes only the recent past useful.
+
+    Mutation that turns this red: remove the `prune()` call from `flush`, or
+    make `prune` a no-op.
+    """
+    from classroom_interpreter.agents.health import HealthMetricsStore
+
+    store = HealthMetricsStore(
+        tmp_path / "health.sqlite3",
+        max_buffered=4096,
+        max_samples=50,
+        prune_every=1,
+    )
+    for index in range(400):
+        store.record_metric("pipeline.live_delay_ms", float(index))
+    while store.flush(batch_size=64):
+        pass
+
+    with store._connect() as connection:
+        count, newest = connection.execute(
+            "SELECT COUNT(*), MAX(numeric_value) FROM health_metric_samples"
+        ).fetchone()
+
+    assert count <= 51, f"{count} samples retained with a cap of 50"
+    assert newest == 399.0, "pruning dropped the newest samples"
