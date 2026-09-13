@@ -145,3 +145,91 @@ def test_check_is_serialized_with_pause(database, tmp_path):
     listener.pause_capture()
     assert listener.check()
     listener.close()
+
+
+class _Status:
+    """A PortAudio callback status, the shape sounddevice hands the callback."""
+
+    def __init__(self, *, input_overflow=False, input_underflow=False):
+        self.input_overflow = input_overflow
+        self.input_underflow = input_underflow
+
+    def __bool__(self):
+        return self.input_overflow or self.input_underflow
+
+
+class _Timing:
+    inputBufferAdcTime = 0.0
+    currentTime = 0.0
+
+
+def _driveable(database, tmp_path):
+    listener = AudioListener(database, tmp_path, rate=16000, synthetic=True)
+    listener.begin('overflow')
+    return listener
+
+
+def test_an_input_overflow_does_not_end_the_class(database, tmp_path):
+    """PortAudio discards samples whenever this process is briefly behind -- a
+    GC pause, a disk write, another application taking the CPU. On a laptop
+    running a three-hour class that is an ordinary event.
+
+    It used to set a fatal fault and abort the stream, which is the same
+    mistake already corrected one layer down for ADC discontinuities: the
+    samples are gone either way, and stopping capture does not recover them. It
+    only destroys the rest of the class to preserve the continuity of the part
+    already written. The gap is still sealed, timestamped and counted by the
+    consumer, so the record does not pretend the audio was there.
+
+    Mutation that turns this red: fault on any status, as before.
+    """
+    listener = _driveable(database, tmp_path)
+    try:
+        listener._callback(b"\0\0" * 320, 320, _Timing(), _Status(input_overflow=True))
+
+        assert listener.fault is None, f"a routine overflow killed capture: {listener.fault}"
+        assert listener.accepting is True, "capture stopped accepting audio"
+        assert listener.overruns == 1, "the overflow was not counted"
+    finally:
+        listener.close()
+
+
+def test_a_stream_that_keeps_overflowing_is_still_a_fault(database, tmp_path):
+    """Tolerance is not blindness. Past the same budget the gap tolerance uses,
+    the device really is failing.
+
+    Mutation that turns this red: drop the `self.overruns <=
+    self.max_tolerated_gaps` half of the condition.
+    """
+    listener = _driveable(database, tmp_path)
+    listener.max_tolerated_gaps = 3
+    try:
+        with pytest.raises(Exception):
+            for _ in range(5):
+                listener._callback(
+                    b"\0\0" * 320, 320, _Timing(), _Status(input_overflow=True)
+                )
+
+        assert listener.fault == 'CALLBACK_STATUS'
+        assert listener.accepting is False
+    finally:
+        listener.close()
+
+
+def test_a_status_that_is_not_an_overflow_is_still_fatal(database, tmp_path):
+    """Only the discarded-samples case is survivable; anything else is a device
+    telling us something we do not understand.
+
+    Mutation that turns this red: tolerate any status, not only
+    `input_overflow`.
+    """
+    listener = _driveable(database, tmp_path)
+    try:
+        with pytest.raises(Exception):
+            listener._callback(
+                b"\0\0" * 320, 320, _Timing(), _Status(input_underflow=True)
+            )
+
+        assert listener.fault == 'CALLBACK_STATUS'
+    finally:
+        listener.close()

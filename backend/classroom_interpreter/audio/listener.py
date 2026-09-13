@@ -208,9 +208,28 @@ class AudioListener:
         self.last_arrival = now
         if status:
             self.overruns += 1
-            self.fault = 'CALLBACK_STATUS'
-            self.accepting = False
-            raise sd.CallbackAbort
+            # An input overflow means PortAudio discarded samples because this
+            # process was briefly behind -- a GC pause, a disk write, another
+            # application taking the CPU. On a laptop running a three-hour
+            # class that is an ordinary event, not a broken microphone.
+            #
+            # It used to end the recording. That is the same mistake already
+            # corrected one layer down for ADC discontinuities, left standing
+            # here: the samples are gone either way, and stopping capture does
+            # not recover them -- it only destroys the rest of the class to
+            # preserve the continuity of the part already written. The lost
+            # samples surface as a timestamp gap in the consumer, which seals
+            # the chunk, writes an `audio_gap` event and counts it, so the
+            # record still states plainly that audio is missing.
+            #
+            # A stream that keeps overflowing is a different thing: past the
+            # same budget the gap tolerance uses, the device really is failing
+            # and the fault stands. Any other status flag is fatal as before.
+            if not (status.input_overflow and self.overruns <= self.max_tolerated_gaps):
+                self.fault = 'CALLBACK_STATUS'
+                self.fault_detail = f'overruns={self.overruns}'
+                self.accepting = False
+                raise sd.CallbackAbort
         if frames > round(self.rate * .02) or len(data) != frames * self.channels * 2:
             self.fault = 'CALLBACK_BUFFER_INVALID'
             self.accepting = False

@@ -61,9 +61,17 @@ def run_to_purged(tmp_path: Path):
         deadline = time.monotonic() + 15
         gone = False
         while time.monotonic() < deadline:
-            probe = client.get(f"/api/sessions/{session_id}")
-            if probe.status_code == 404:
-                gone = True
+            # The durable fact, not the HTTP status. `GET /api/sessions/{id}`
+            # used to 404 for a purged class, and this waited on that -- but a
+            # 404 was also what made the client stop updating the screen of the
+            # class it had just finished, so the endpoint now answers with the
+            # retained metadata instead. What purge guarantees is that the
+            # `sessions` row is gone; ask the database that directly.
+            with database.connect() as connection:
+                gone = connection.execute(
+                    "SELECT COUNT(*) AS n FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()["n"] == 0
+            if gone:
                 break
             time.sleep(0.1)
         assert gone, "session row should be deleted after successful purge"

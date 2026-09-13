@@ -44,12 +44,29 @@ def sync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def restrict(path: Path) -> None:
+    """Owner-only, for a file holding classroom audio or its manifest.
+
+    Capture chunks are the raw microphone recording of a class -- the most
+    sensitive artifact this product creates -- and they were written at the
+    process umask, 0644. Verified on a real machine: 217 world-readable WAV
+    files. Only the enclosing directory's 0700 kept them out of reach, which
+    is a single level of luck; segment audio and the database have had
+    owner-only modes on the files themselves for exactly that reason.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + '.tmp')
     with temporary.open('x', encoding='utf-8') as handle:
         json.dump(value, handle, sort_keys=True)
         handle.flush()
         os.fsync(handle.fileno())
+    restrict(temporary)
     os.replace(temporary, path)
     sync_directory(path.parent)
 
@@ -219,6 +236,7 @@ class ChunkWriter:
         if self.final.exists() or self.final.with_suffix('.json').exists():
             raise ValueError('CHUNK_PATH_EXISTS')
         self.handle = self.temporary.open('xb')
+        restrict(self.temporary)
         self.wav = wave.open(self.handle, 'wb')
         self.wav.setparams((self.channels, 2, self.rate, 0, 'NONE', 'not compressed'))
         self.started, self.wall, self.epoch = ns, wall, epoch

@@ -110,3 +110,68 @@ def test_recorded_segment_audio_is_owner_only(database, tmp_path):
         "the session directory was left 0755 because mkdir(mode=) does not "
         "apply to parents or to an existing directory"
     )
+
+
+def test_raw_capture_audio_is_owner_only(database, tmp_path):
+    """The capture chunks ARE the class: the raw microphone recording, before
+    any segmentation. They were written at the process umask -- verified on a
+    real machine, 217 WAV files at `-rw-r--r--`. Only the enclosing
+    directory's 0700 kept them out of reach, and segment audio and the database
+    have had owner-only file modes for exactly that reason.
+
+    Mutation that turns this red: drop the `restrict(self.temporary)` call in
+    `ChunkWriter._open`.
+    """
+    import helpers_phase3 as h
+
+    session_id = h.make_session(database)
+    root = tmp_path / "capture"
+    blocks = h.envelope_blocks([("speech", 2.0), ("silence", 1.0)])
+    h.write_chunks(database, root, session_id, blocks, chunk_seconds=1)
+
+    wavs = sorted(root.rglob("*.wav"))
+    assert wavs, "no capture chunk was written, so nothing was audited"
+    for path in wavs:
+        assert mode_of(path) & GROUP_AND_OTHER == 0, (
+            f"{path.name} holds classroom audio and is readable by other accounts"
+        )
+
+
+def test_the_chunk_manifest_is_owner_only(database, tmp_path):
+    """The manifest carries timestamps and a checksum of that audio.
+
+    Mutation that turns this red: drop the `restrict(temporary)` call in
+    `atomic_json`.
+    """
+    import helpers_phase3 as h
+
+    session_id = h.make_session(database)
+    root = tmp_path / "capture"
+    h.write_chunks(
+        database, root, session_id, h.envelope_blocks([("speech", 2.0)]), chunk_seconds=1
+    )
+
+    manifests = sorted(root.rglob("*.json"))
+    assert manifests, "no manifest was written, so nothing was audited"
+    for path in manifests:
+        assert mode_of(path) & GROUP_AND_OTHER == 0
+
+
+def test_the_saved_summary_is_owner_only(tmp_path):
+    """The summary is the distilled content of a class and the one artifact
+    that deliberately outlives purge.
+
+    Mutation that turns this red: drop the `os.chmod(final_path, 0o600)` in
+    `SummaryAgent._atomic_write`.
+    """
+    from pathlib import Path
+
+    from classroom_interpreter.storage.repository import SessionRepository
+    from test_summary_pipeline import run_flow_to_summary
+
+    client, database, runtime, session_id, status = run_flow_to_summary(tmp_path)
+    assert status == "SUMMARY_SAVED"
+    path = Path(SessionRepository(database).get_session(session_id).summary_path)
+
+    assert mode_of(path) & GROUP_AND_OTHER == 0, "the summary is readable by others"
+    assert mode_of(path.parent) & GROUP_AND_OTHER == 0

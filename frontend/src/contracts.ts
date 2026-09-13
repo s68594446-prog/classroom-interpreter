@@ -104,3 +104,21 @@ export interface RecoverySession {
   session: SessionRecord;
   progress: Progress;
 }
+
+
+export interface SummaryListItem {
+  session_id: string;
+  course_name: string;
+  status: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_ms: number | null;
+  finished_at: string | null;
+}
+
+export interface SummaryDocument {
+  session_id: string;
+  course_name: string;
+  markdown: string;
+  filename: string;
+}

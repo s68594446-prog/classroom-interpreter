@@ -361,6 +361,15 @@ class SummaryAgent:
             handle.flush()
             os.fsync(handle.fileno())
         _replace_summary_file(temporary, final_path)
+        # The summary is the distilled content of a class, and it is the one
+        # artifact that deliberately survives purge -- it outlives everything
+        # else in the product. It was written at the process umask, 0644, while
+        # segment audio and the database were already owner-only.
+        try:
+            os.chmod(final_path, 0o600)
+            os.chmod(final_path.parent, 0o700)
+        except OSError:
+            pass
         sync_directory(final_path.parent)
         read_back = final_path.read_bytes()
         if hashlib.sha256(read_back).hexdigest() != hashlib.sha256(payload).hexdigest():

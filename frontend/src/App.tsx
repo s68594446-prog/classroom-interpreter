@@ -6,6 +6,8 @@ import type {
   Progress,
   SessionRecord,
   SessionStatus,
+  SummaryDocument,
+  SummaryListItem,
   WebSocketEvent,
 } from "./contracts";
 import "./styles.css";
@@ -23,6 +25,15 @@ function formatClock(ms: number): string {
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function formatDay(iso: string | null): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+    date.getDate(),
+  ).padStart(2, "0")}`;
 }
 
 function statusLabel(status: SessionStatus): string {
@@ -46,6 +57,53 @@ function statusLabel(status: SessionStatus): string {
     default:
       return status;
   }
+}
+
+function summaryErrorText(detail: unknown): string {
+  switch (detail) {
+    case "NO_SUMMARY_YET":
+      return "这节课还没有总结。";
+    case "SUMMARY_FILE_MISSING":
+      return "总结文件找不到了（可能被移动或删除）。";
+    case "SUMMARY_HASH_MISMATCH":
+      return "总结文件和保存时不一致，已被改动过，不再按原文显示。";
+    case "SUMMARY_OUTSIDE_STORE":
+      return "总结文件不在总结目录里，拒绝读取。";
+    case "SUMMARY_INVALID":
+      return "总结文件结构不完整。";
+    default:
+      return "无法读取总结。";
+  }
+}
+
+/** The summary is Markdown with a fixed ten-section shape (PRODUCT.md). This
+ *  renders exactly that shape -- headings, list items, paragraphs -- rather
+ *  than pulling in a Markdown library for a document whose structure is
+ *  already validated server-side. */
+function SummaryBody({ markdown }: { markdown: string }) {
+  const lines = markdown.split("\n");
+  return (
+    <div className="summary-body">
+      {lines.map((line, index) => {
+        const text = line.trimEnd();
+        if (!text.trim()) return null;
+        if (text.startsWith("## ")) {
+          return <h3 key={index}>{text.slice(3)}</h3>;
+        }
+        if (text.startsWith("# ")) {
+          return <h2 key={index}>{text.slice(2)}</h2>;
+        }
+        if (/^\s*[-*]\s+/.test(text)) {
+          return (
+            <p className="summary-item" key={index}>
+              {text.replace(/^\s*[-*]\s+/, "")}
+            </p>
+          );
+        }
+        return <p key={index}>{text}</p>;
+      })}
+    </div>
+  );
 }
 
 interface GlossaryTerm {
@@ -72,6 +130,11 @@ export function App() {
   const [termInput, setTermInput] = useState("");
   const [termZh, setTermZh] = useState("");
   const [glossaryOpen, setGlossaryOpen] = useState(false);
+  // Past classes and the summary being read. The summary is the product's
+  // whole output and there was no way to see it from the app at all.
+  const [pastSummaries, setPastSummaries] = useState<SummaryListItem[]>([]);
+  const [openSummary, setOpenSummary] = useState<SummaryDocument | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   // The sentence still being spoken. `chineseFor` records which English the
   // Chinese was translated from, so a stale Chinese line is dropped the
   // moment the transcriber revises the words underneath it.
@@ -251,6 +314,43 @@ export function App() {
     return () => clearInterval(id);
   }, []);
 
+  const loadSummaries = useCallback(async () => {
+    try {
+      const r = await fetch("/api/summaries");
+      if (!r.ok) return;
+      setPastSummaries(((await r.json()).summaries ?? []) as SummaryListItem[]);
+    } catch {
+      /* a missing list is not worth an error banner */
+    }
+  }, []);
+
+  const showSummary = useCallback(async (sessionId: string) => {
+    setSummaryError(null);
+    const r = await fetch(`/api/sessions/${sessionId}/summary`);
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      setSummaryError(summaryErrorText(body.detail));
+      setOpenSummary(null);
+      return;
+    }
+    setOpenSummary((await r.json()) as SummaryDocument);
+  }, []);
+
+  useEffect(() => {
+    loadSummaries();
+  }, [loadSummaries]);
+
+  // The summary is what the class was for. As soon as one exists, load it --
+  // the alternative was a screen that said "generating summary" and then
+  // stopped saying anything at all.
+  useEffect(() => {
+    if (!session) return;
+    if (session.status !== "SUMMARY_SAVED" && session.status !== "PURGED") return;
+    if (openSummary?.session_id === session.id) return;
+    showSummary(session.id);
+    loadSummaries();
+  }, [session, openSummary, showSummary, loadSummaries]);
+
   const startClass = async () => {
     setStarting(true);
     setError(null);
@@ -418,6 +518,44 @@ export function App() {
             </button>
           </div>
           {error && <p className="error-text">{error}</p>}
+          {pastSummaries.length > 0 && (
+            <div className="summary-list-card">
+              <h2>课程总结</h2>
+              <p>每节课结束后生成的结构化笔记。录音会被清理，总结会一直保留。</p>
+              {pastSummaries.map((s) => (
+                <div className="summary-row" key={s.session_id}>
+                  <span className="summary-row-name">{s.course_name}</span>
+                  <span className="summary-row-meta">
+                    {formatDay(s.finished_at)}
+                    {s.duration_ms ? ` · ${formatClock(s.duration_ms)}` : ""}
+                  </span>
+                  <button type="button" onClick={() => showSummary(s.session_id)}>
+                    查看
+                  </button>
+                </div>
+              ))}
+              {summaryError && <p className="error-text">{summaryError}</p>}
+              {openSummary && (
+                <div className="summary-panel">
+                  <div className="summary-panel-head">
+                    <strong>{openSummary.course_name}</strong>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigator.clipboard?.writeText(openSummary.markdown)
+                      }
+                    >
+                      复制全文
+                    </button>
+                    <button type="button" onClick={() => setOpenSummary(null)}>
+                      关闭
+                    </button>
+                  </div>
+                  <SummaryBody markdown={openSummary.markdown} />
+                </div>
+              )}
+            </div>
+          )}
           {recoverable.length > 0 && (
             <div className="recovery-card">
               <h2>未完成的会话</h2>
@@ -620,6 +758,46 @@ export function App() {
               <p className="progress-line">
                 正在等待全部语音与翻译完成，随后生成课程总结…
               </p>
+            )}
+            {/* The class was recorded for this. It used to be written to a
+                file and never shown: the screen stayed on "generating
+                summary" and the class then vanished from the home list,
+                because a completed class is purged and the list excluded
+                purged sessions. */}
+            {(session.status === "SUMMARY_SAVED" ||
+              session.status === "PURGED") && (
+              <div className="summary-panel">
+                <div className="summary-panel-head">
+                  <strong>课程总结已生成</strong>
+                  {openSummary && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigator.clipboard?.writeText(openSummary.markdown)
+                      }
+                    >
+                      复制全文
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSession(null);
+                      sessionIdRef.current = null;
+                      setOpenSummary(null);
+                      loadSummaries();
+                    }}
+                  >
+                    回到首页
+                  </button>
+                </div>
+                {summaryError && <p className="error-text">{summaryError}</p>}
+                {openSummary ? (
+                  <SummaryBody markdown={openSummary.markdown} />
+                ) : (
+                  !summaryError && <p className="progress-line">正在载入总结…</p>
+                )}
+              </div>
             )}
           </section>
 
