@@ -36,6 +36,11 @@ class SegmentState(StrEnum):
     TRANSLATION_RETRY = "TRANSLATION_RETRY"
     TRANSLATION_FAILED = "TRANSLATION_FAILED"
     DONE = "DONE"
+    # The recogniser found no speech in this segment. Terminal, and NOT a
+    # failure: there is nothing to transcribe, nothing was lost, and the class
+    # is still complete without it. Kept distinct from ASR_FAILED, which means
+    # audio we could not transcribe -- real content, missing.
+    NO_SPEECH = "NO_SPEECH"
 
 
 class HealthStatus(StrEnum):

@@ -123,9 +123,7 @@ def test_parse_response_happy_path():
         b"",
         b"not json",
         json.dumps({"choices": []}).encode(),
-        json.dumps({"choices": [{"message": {"content": ""}}]}).encode(),
         json.dumps({"choices": [{"message": {}}]}).encode(),
-        json.dumps({"choices": [{"message": {"content": "  "}}]}).encode(),
         json.dumps({"error": {"code": "InternalError"}}).encode(),
     ],
 )
@@ -133,6 +131,32 @@ def test_parse_response_malformed_variants(body):
     with pytest.raises(ProviderFailure) as excinfo:
         parse_asr_response(body)
     assert excinfo.value.error.category is ProviderErrorCategory.MALFORMED
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps({"choices": [{"message": {"content": ""}}]}).encode(),
+        json.dumps({"choices": [{"message": {"content": "  "}}]}).encode(),
+        # Nothing but chat-template scaffolding. This used to survive the parser
+        # and then raise a pydantic ValidationError when the TranscriptResult
+        # was built, which escaped as UNKNOWN/retryable -- a silent segment
+        # retried five times under a category meaning "we do not know".
+        json.dumps({"choices": [{"message": {"content": "<chinese>"}}]}).encode(),
+    ],
+)
+def test_an_empty_transcript_is_an_answer_not_a_failure(body):
+    """Empty is deterministic: the same audio comes back empty every time, so
+    every retry is a paid call that cannot succeed. Classifying it as MALFORMED
+    cost five attempts per silent segment and then ASR_FAILED, which stops the
+    whole class from being summarised.
+
+    Mutation that turns this red: raise `_malformed` for empty content again.
+    """
+    from classroom_interpreter.providers.errors import EmptyTranscript
+
+    with pytest.raises(EmptyTranscript):
+        parse_asr_response(body)
 
 
 def test_parse_response_content_filter_variants():

@@ -51,9 +51,13 @@ SEGMENT_TRANSITIONS: Mapping[SegmentState, frozenset[SegmentState]] = {
             SegmentState.ASR_RETRY,
             SegmentState.ASR_FAILED,
             SegmentState.ASR_PENDING,
+            SegmentState.NO_SPEECH,
         }
     ),
     SegmentState.ASR_RETRY: frozenset({SegmentState.ASR_PENDING}),
+    # Terminal. A silent segment is never reprocessed: the answer will not
+    # change, and every retry of it is a paid call for nothing.
+    SegmentState.NO_SPEECH: frozenset(),
     SegmentState.ASR_FAILED: frozenset({SegmentState.ASR_PENDING}),
     SegmentState.ASR_DONE: frozenset({SegmentState.TRANSLATION_PENDING}),
     SegmentState.TRANSLATION_PENDING: frozenset({SegmentState.TRANSLATION_PROCESSING}),

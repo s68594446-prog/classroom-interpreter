@@ -13,7 +13,7 @@ from classroom_interpreter.domain.models import (
     utc_now,
 )
 from classroom_interpreter.providers.base import ASRProvider
-from classroom_interpreter.providers.errors import ProviderFailure
+from classroom_interpreter.providers.errors import EmptyTranscript, ProviderFailure
 from classroom_interpreter.storage.repository import IdempotencyConflict, SessionRepository
 
 # Categories that must never enter an automatic retry loop (FAILURE_MODES.md).
@@ -149,6 +149,21 @@ class TranscriptionAgent:
                 retry_after_ms=None,
                 started=started,
             )
+            return
+        except EmptyTranscript:
+            # Not a failure: the recogniser heard nothing. Terminal, with no
+            # retries -- the answer is deterministic, so each retry was a paid
+            # call that could not succeed -- and NOT counted as a failed
+            # segment, because nothing was lost. ASR_FAILED would have stopped
+            # the whole class from being summarised (D-006) over two seconds of
+            # silence, which is what happened on a live session.
+            self._repository.finish_asr_attempt(
+                segment.id,
+                attempt_number=attempt_number,
+                outcome="NO_SPEECH",
+                latency_ms=int((utc_now() - started).total_seconds() * 1000),
+            )
+            self._repository.mark_segment_no_speech(session_id, sequence)
             return
         except ProviderFailure as failure:
             error = failure.error

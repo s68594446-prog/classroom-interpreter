@@ -73,7 +73,12 @@ class SummaryAgent:
         sequences = [row["sequence"] for row in rows]
         if sequences != list(range(len(sequences))):
             raise SummaryValidationError("segment sequences are not contiguous")
-        bad = [row["sequence"] for row in rows if row["state"] != "DONE"]
+        # NO_SPEECH is terminal and complete: the recogniser heard nothing, so
+        # there is nothing missing from the transcript. It contributes no text
+        # (the transcript reads DONE segments only) and must not block the
+        # summary the way a genuine ASR failure does.
+        terminal = {"DONE", "NO_SPEECH"}
+        bad = [row["sequence"] for row in rows if row["state"] not in terminal]
         if bad:
             raise SummaryValidationError(
                 f"segments not DONE: {bad[:5]}" + (" ..." if len(bad) > 5 else "")

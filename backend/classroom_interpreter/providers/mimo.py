@@ -18,7 +18,7 @@ from classroom_interpreter.domain.models import (
     TranslationResult,
     utc_now,
 )
-from .errors import ProviderFailure
+from .errors import EmptyTranscript, ProviderFailure
 
 # Official MiMo documentation: encoded audio payload limit is 10 MB.
 MAX_ENCODED_AUDIO_BYTES = 10 * 1024 * 1024
@@ -206,9 +206,18 @@ def parse_asr_response(body: bytes) -> tuple[str, str | None]:
     if not isinstance(message, dict):
         raise _malformed("choice has no message")
     text = message.get("content")
-    if not isinstance(text, str) or not text.strip():
-        raise _malformed("response content is empty or non-text")
-    return strip_asr_scaffolding(text), request_id
+    if not isinstance(text, str):
+        raise _malformed("response content is non-text")
+    if not text.strip():
+        raise EmptyTranscript("the recogniser returned no text")
+    stripped = strip_asr_scaffolding(text)
+    if not stripped.strip():
+        # The whole response was chat-template scaffolding. Constructing a
+        # TranscriptResult from it raised a pydantic ValidationError, which
+        # escaped as UNKNOWN/retryable -- so a silent segment was retried five
+        # times under a category that says "we do not know what went wrong".
+        raise EmptyTranscript("the recogniser returned only scaffolding")
+    return stripped, request_id
 
 
 # Chat-template scaffolding the real `mimo-v2.5-asr` model emits around the

@@ -719,6 +719,41 @@ class SessionRepository:
                 connection, session_id, category, safe_message, _now_iso()
             )
 
+    def mark_segment_no_speech(self, session_id: str, sequence: int) -> None:
+        """Terminal, and deliberately not a failure.
+
+        The recogniser found no speech in this segment. There is nothing to
+        transcribe and nothing was lost, so the class is still complete without
+        it: `progress()` counts it as neither pending nor failed, the summary
+        reads DONE segments only, and no retry is ever scheduled.
+        """
+        now = _now_iso()
+        with self.database.transaction() as connection:
+            segment = _require_segment(connection, session_id, sequence)
+            current = SegmentState(segment["state"])
+            if current is SegmentState.NO_SPEECH:
+                return  # idempotent
+            ensure_segment_transition(current, SegmentState.NO_SPEECH)
+            connection.execute(
+                """
+                UPDATE segments
+                SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    asr_next_attempt_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (SegmentState.NO_SPEECH.value, now, segment["id"]),
+            )
+            _insert_transition_audit(
+                connection,
+                entity_type="segment",
+                entity_id=segment["id"],
+                from_state=current.value,
+                to_state=SegmentState.NO_SPEECH.value,
+                reason_code="ASR_FOUND_NO_SPEECH",
+                actor="transcription_agent",
+                created_at=now,
+            )
+
     def commit_asr_result(
         self, session_id: str, sequence: int, result: TranscriptResult
     ) -> CommitOutcome:
@@ -1054,6 +1089,7 @@ class SessionRepository:
         `session_id` confines the release to one class."""
         now = _now_iso()
         with self.database.transaction() as connection:
+            self._skip_silent_segments(connection, session_id, now)
             row = connection.execute(
                 """
                 SELECT staged.*, asr.english_text, seg.state AS segment_state
@@ -1127,6 +1163,41 @@ class SessionRepository:
                 "english_text": row["english_text"],
                 "chinese_text": row["chinese_text"],
             }
+
+    @staticmethod
+    def _skip_silent_segments(connection, session_id: str | None, now: str) -> int:
+        """Move the ordered release cursor past segments that hold no speech.
+
+        Translations are released strictly in sequence, at the cursor. A
+        NO_SPEECH segment never produces a staged translation, so the cursor
+        stops at the first one and every later sentence is stuck behind it
+        forever -- the class drains to a halt and can never be summarised.
+        Reproduced exactly that way: one silent segment, the next stuck in
+        TRANSLATION_PROCESSING, the session frozen in FINALIZING.
+
+        Several silent segments can be adjacent, so this advances until the
+        cursor rests on one that is not silent.
+        """
+        skipped = 0
+        while True:
+            updated = connection.execute(
+                """
+                UPDATE sessions
+                SET next_translation_sequence = next_translation_sequence + 1,
+                    updated_at = :now, version = version + 1
+                WHERE (:session IS NULL OR id = :session)
+                  AND EXISTS (
+                      SELECT 1 FROM segments g
+                      WHERE g.session_id = sessions.id
+                        AND g.sequence = sessions.next_translation_sequence
+                        AND g.state = 'NO_SPEECH'
+                  )
+                """,
+                {"now": now, "session": session_id},
+            )
+            if not updated.rowcount:
+                return skipped
+            skipped += updated.rowcount
 
     def finish_translation_attempt(
         self,
