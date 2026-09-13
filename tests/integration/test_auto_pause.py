@@ -144,12 +144,16 @@ def test_segmenter_reports_no_idle_silence_while_speech_is_open(tmp_path):
     with client:
         client.post("/api/sessions", json={"course_name": "Mid"}).json()
         segmenter = runtime._segmenter
+        # `idle_frames`, not `silence_run`: idle time is now counted since the
+        # last sealed segment, so that a discarded blip of noise cannot reset
+        # it (see test_idle_and_recovery.py). The property this test protects
+        # -- zero while a sentence is open -- is unchanged.
         segmenter._state = SegmenterState(
-            in_utterance=True, silence_run=10_000 // FRAME_MS
+            in_utterance=True, idle_frames=10_000 // FRAME_MS
         )
         assert segmenter.idle_silence_ms() == 0
         segmenter._state = SegmenterState(
-            in_utterance=False, silence_run=10_000 // FRAME_MS
+            in_utterance=False, idle_frames=10_000 // FRAME_MS
         )
         assert segmenter.idle_silence_ms() == 10_000
 

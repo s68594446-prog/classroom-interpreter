@@ -1,0 +1,12 @@
+-- Auto-pause measured the segmenter's `silence_run`, and that counter is zeroed
+-- every time an utterance opens -- including an "utterance" that is one cough or
+-- keystroke and is then discarded as too short to be speech. The silence that
+-- came before the blip was thrown away with it.
+--
+-- Observed on a live session: forty minutes of an empty room, a counter reading
+-- 63 seconds, and a 10-minute auto-pause that could therefore never fire.
+--
+-- `idle_frames` counts frames since the last *sealed* segment. Only real speech
+-- resets it; noise that is discarded does not. Checkpointed with the rest of the
+-- segmenter state so a restart resumes the count rather than restarting it.
+ALTER TABLE pipeline_cursors ADD COLUMN idle_frames INTEGER NOT NULL DEFAULT 0;

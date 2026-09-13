@@ -108,6 +108,9 @@ class SegmenterState:
     preroll_pcm: bytearray = field(default_factory=bytearray)
     carry_pcm: bytearray = field(default_factory=bytearray)
     discarded_utterances: int = 0
+    # Frames since the last SEALED segment. Unlike `silence_run`, a discarded
+    # blip of noise does not reset it -- see `idle_silence_ms`.
+    idle_frames: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +221,7 @@ class SegmentAgent:
             preroll_pcm=bytearray(row["preroll_pcm"]),
             carry_pcm=bytearray(row["carry_pcm"]),
             discarded_utterances=row["discarded_utterances"],
+            idle_frames=row["idle_frames"],
         )
 
     def _checkpoint(self, connection, state: SegmenterState) -> None:
@@ -231,8 +235,8 @@ class SegmentAgent:
                 preroll_pcm, carry_pcm, discarded_utterances,
                 noise_floor_rms, level_block_index, level_block_min,
                 level_block_max, level_previous_min, level_previous_max,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                idle_frames, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 next_chunk_sequence = excluded.next_chunk_sequence,
                 consumed_native_frames = excluded.consumed_native_frames,
@@ -254,6 +258,7 @@ class SegmentAgent:
                 level_block_max = excluded.level_block_max,
                 level_previous_min = excluded.level_previous_min,
                 level_previous_max = excluded.level_previous_max,
+                idle_frames = excluded.idle_frames,
                 updated_at = excluded.updated_at
             """,
             (
@@ -278,6 +283,7 @@ class SegmentAgent:
                 state.level_block_max,
                 state.level_previous_min,
                 state.level_previous_max,
+                state.idle_frames,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -586,6 +592,7 @@ class SegmentAgent:
         config = self.config
         start_ms = int(row["start_ms"]) + state.consumed_normalized_frames * FRAME_MS
         state.consumed_normalized_frames += 1
+        state.idle_frames += 1
         samples = np.frombuffer(frame, dtype="<i2").astype(np.float32)
         rms = float(np.sqrt(np.mean(samples * samples)))
         voiced = rms >= self._update_threshold(state, rms)
@@ -732,7 +739,12 @@ class SegmentAgent:
         """
         if self._state.in_utterance:
             return 0
-        return self._state.silence_run * FRAME_MS
+        # Not `silence_run`. That counter is zeroed whenever an utterance
+        # opens, including an "utterance" that is one cough or keystroke and is
+        # then discarded as too short to be speech -- which threw away all the
+        # silence before it. Forty minutes of empty room read as 63 seconds on
+        # a live session, and a ten-minute auto-pause could never fire.
+        return self._state.idle_frames * FRAME_MS
 
 
     @_serialized
@@ -756,6 +768,8 @@ class SegmentAgent:
 
     def _seal_segment(self) -> SealedSegment:
         state = self._state
+        # Real speech: the room is not idle.
+        state.idle_frames = 0
         pcm = bytes(state.pending_pcm)
         duration_ms = _pcm_duration_ms(pcm)
         if duration_ms <= 0:
