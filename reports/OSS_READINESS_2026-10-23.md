@@ -48,3 +48,22 @@ Target-hardware three-hour operation, sleep/device recovery, current real-provid
 quality, real-data cleanup and independent final acceptance remain unverified here.
 Next: separately authorized hardware/provider acceptance with synthetic or explicitly
 consented data, followed by independent final review. No phase promotion is claimed.
+
+## Dependency security follow-up
+
+GitHub reported eight open dependency alerts after private reporting and dependency
+alerts were enabled. Updated Vite 8.2.2 → 8.2.4, source-map-js 1.2.1 → 1.2.2,
+and pytest to >=9.0.3,<10 (uv resolves 9.1.1). Updated frontend/package.json,
+frontend/package-lock.json, pyproject.toml and uv.lock. Regenerating uv.lock also
+restored the already-declared websockets dependency missing from the old lock.
+No new runtime dependency was added to pyproject.toml.
+
+After these changes:
+- `npm audit --json`: zero reported vulnerabilities.
+- `npm run typecheck` and `npm run build`: PASS with Vite 8.2.4.
+- `.venv/bin/python -m pytest -o addopts='' -q`: 376 passed in 145.32 seconds.
+- `.venv/bin/python -m pip check`: no broken requirements.
+- `git diff --check`: PASS; dependency diffs contain package metadata only.
+
+These are local dependency and synthetic regression checks, not a guarantee that
+all vulnerabilities are known or that production/hardware behavior is verified.
