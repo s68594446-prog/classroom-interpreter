@@ -92,21 +92,18 @@ def test_the_close_failure_is_recorded_not_hidden(tmp_path):
         view = client.post("/api/sessions", json={"course_name": "Recorded"}).json()
         session_id = view["session"]["id"]
         client.post(f"/api/sessions/{session_id}/end")
-        # Read it here, not after the drain: `last_error_*` holds only the most
-        # recent error, so a later summary failure overwrites the capture one
-        # that caused it. That is its own shortcoming -- the first error is
-        # usually the cause and the last one the consequence -- but it is not
-        # what this test is about.
-        record = runtime.repository.get_session(session_id)
         assert runtime.worker_faults.get("capture-close"), (
             "the close failure was not counted, so it never reaches /health"
         )
         wait_for_status(client, session_id, ("SUMMARY_SAVED", "RECOVERY_REQUIRED"))
 
-    assert record.last_error_category == "CAPTURE"
-    assert "OSError" in (record.last_error_safe_message or ""), (
+    # The durable first-error fields preserve the capture cause even when
+    # the background summary has already updated last_error_*. Read after drain.
+    record = runtime.repository.get_session(session_id)
+    assert record.first_error_category == "CAPTURE"
+    assert "OSError" in (record.first_error_safe_message or ""), (
         "the failure type was discarded, leaving no way to tell what happened"
     )
-    assert "Recorded" not in (record.last_error_safe_message or ""), (
+    assert "Recorded" not in (record.first_error_safe_message or ""), (
         "the course name leaked into an error field"
     )

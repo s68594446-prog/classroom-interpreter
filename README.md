@@ -1,82 +1,49 @@
 # Classroom Interpreter
 
-macOS 本地优先的课堂实时英译中与课后总结工具。
+面向 macOS 的本地课堂转录与翻译工具：采集音频、保存原始片段、调用配置的 MiMo 服务，并展示英文转录与中文翻译。数据优先落盘；没有有效总结不得清理原始材料。
 
-## Current status
+## 当前状态
 
-`Phase 10 — Final Audit Candidate（overnight build；未验收）`
+这是持续开发中的项目，尚未完成独立的最终验收。历史验证包括：
 
-完整实现候选：音频采集、语义分段、MiMo ASR/翻译/总结 adapter、持久化队列、实时 UI、总结原子保存与验证、exact-manifest 清理、加速 soak（1,800 segments）。真实 MiMo、真实三小时麦克风 soak、权限/睡眠/设备矩阵仍未测试，等待独立 Reviewer/Validator/Oracle 与用户验收。见 `reports/FINAL_BUILDER_HANDOFF.md`。
+- [2026-09-11 短时真实 MiMo 验证](reports/LIVE_MIMO_VERIFICATION_2026-09-11.md)。
+- [2026-09-12 小规模课堂素材测试](reports/REAL_CLASSROOM_TEST_2026-09-12.md)。
+- [2026-09-12 持续运行记录](reports/SUSTAINED_RUN_2026-09-12.md)：原计划 60 分钟，约 29 分钟停止；之后的修复不能视为已完成同等端到端复测。
 
-请先审阅：
+三小时运行、休眠与设备/权限恢复、真实数据清理以及独立最终验收仍需专项验证。离线测试通过只证明测试覆盖的行为。
 
-- [ARCHITECTURE.md](ARCHITECTURE.md)
-- [PRODUCT.md](PRODUCT.md)
-- [AGENTS.md](AGENTS.md)
-- [DATA_LIFECYCLE.md](DATA_LIFECYCLE.md)
-- [FAILURE_MODES.md](FAILURE_MODES.md)
-- [TEST_PLAN.md](TEST_PLAN.md)
-- [DECISIONS.md](DECISIONS.md)
+## 安装与运行
 
-## V1 boundary
+建议 macOS、Python 3.13、Node.js 24。以下命令从仓库根目录运行：
 
-V1 仅支持 Mac 麦克风、English → Simplified Chinese、MiMo 云端 ASR/文本模型、实时字幕、课后结构化总结、故障恢复，以及总结验证后的临时数据清理。
-
-这是 local-first application with cloud AI processing，不是 `100% local`。课堂音频片段与文字会按处理阶段发送给 MiMo。
-
-## Safety invariants
-
-```text
-PERSIST FIRST, PROCESS SECOND
-NO VALID SUMMARY = NO PURGE
+```sh
+git clone https://github.com/s68594446-prog/classroom-interpreter.git
+cd classroom-interpreter
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev,audio]"
+(cd frontend && npm ci && npm run build)
+cp .env.example .env
 ```
 
-V1 的删除是逻辑文件删除，不保证 SSD/APFS 上的法证级安全擦除。
+在本地 `.env` 配置服务密钥，不要提交密钥。启动服务：
 
-## Phase 1 commands
+```sh
+.venv/bin/python -m uvicorn classroom_interpreter.main:app --host 127.0.0.1 --port 8000
+```
 
-```bash
-uv sync --extra dev
+打开 <http://127.0.0.1:8000>。开始课堂前检查输入设备与 macOS 麦克风权限；构建和普通测试不会启动真实录音。启用提供商后，音频与文本会发送到配置的外部服务。默认运行数据保存在 `~/Library/Application Support/Classroom Interpreter`。
+
+## 离线验证
+
+```sh
+(cd frontend && npm run typecheck && npm run build)
 .venv/bin/python -m pytest
 ```
 
-```bash
-cd frontend
-npm install
-npm run typecheck
-npm run build
-```
+测试使用合成输入和模拟服务，不需要生产密钥。真实麦克风、收费模型、长时间运行和清理验收必须单独安排，不能用离线测试替代。
 
-本地 backend：
+## 开发边界
 
-```bash
-CLASSROOM_INTERPRETER_DATA_DIR=/private/tmp/classroom-interpreter-dev \
-  uv run uvicorn classroom_interpreter.main:app --host 127.0.0.1 --port 8000
-```
+阅读 [AGENTS.md](AGENTS.md) 和 [CONTRIBUTING.md](CONTRIBUTING.md) 后再修改。保留 `PERSIST FIRST, PROCESS SECOND` 与 `NO VALID SUMMARY = NO PURGE` 两项约束。不要把真实课堂录音、转录或本机配置作为新增测试素材。
 
-`/health` 会把 microphone、ASR、translation、queue 和 network 明确标为 `PHASE_1_NOT_IMPLEMENTED`，避免把骨架误报为产品可用。
-
-## Next gate
-
-Phase 1 Review 获得确认后，才进入 `Phase 2 — Audio Capture Spike`。Phase 2 必须先验证 Python/CoreAudio-compatible 路线，再决定是否升级为 Swift/AVFoundation helper。
-# Phase 2 audio capture spike (not accepted)
-
-The Phase 1 shell remains the default web application. Phase 2 is an explicit,
-backend-owned audio CLI; launching the web shell does not open the microphone.
-No MiMo, translation, summary, semantic segmentation, or deletion is added.
-
-```
-uv sync --extra dev --extra audio
-PYTHONPATH=backend uv run --extra audio python -m classroom_interpreter.audio devices
-PYTHONPATH=backend uv run --extra audio python -m classroom_interpreter.audio record --seconds 300
-PYTHONPATH=backend uv run --extra dev --extra audio pytest
-```
-
-The explicit `PYTHONPATH=backend` is required on the currently observed macOS
-development environment: editable-install `.pth` files have the hidden file flag
-and the plain installed module launch did not resolve. This is a known packaging
-issue, not proof that the installed application is ready.
-
-See `tests/hardware/README.md` for opt-in hardware tests and privacy limitations,
-`DECISIONS.md` D-024 for the candidate design, and `PHASE2_REVIEW.md` for evidence
-and blockers. Three-hour hardware testing is deferred at the user's request.
+本项目采用 [MIT License](LICENSE)。安全问题请见 [SECURITY.md](SECURITY.md)。

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "classroom-interpreter"
 version = "0.1.0"
-description = "Phase 1 skeleton for a local-first classroom interpreter"
+description = "Local-first classroom transcription and translation"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.136,<0.137",
